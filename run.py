@@ -548,7 +548,7 @@ def main() -> None:
                     )
                 )
 
-                sample_out = output_root / experiment_name / f"{sample_id}_final_output.txt"
+                sample_out = output_root / experiment_dir / f"{safe_name(sample['id'])}_final_output.txt"
                 sample_out.parent.mkdir(parents=True, exist_ok=True)
                 sample_out.write_text(generated_text, encoding="utf-8")
 

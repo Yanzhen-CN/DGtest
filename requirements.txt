@@ -1,17 +1,17 @@
-# Use local patched Transformers source.
--e ./vendor/transformers
-
-# Runtime / model loading
-accelerate
-safetensors
-sentencepiece
-protobuf
-huggingface_hub
-
-# Config / data
-pyyaml
-pandas
-
-# Visualization
+# Direct script dependencies
+PyYAML
 matplotlib
-pillow
+
+# Vendored Transformers runtime dependencies
+huggingface-hub
+tokenizers
+safetensors
+accelerate
+numpy
+packaging
+filelock
+regex
+requests
+tqdm
+
+# Install torch separately according to the CUDA image.

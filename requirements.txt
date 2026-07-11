@@ -1,0 +1,17 @@
+# Use local patched Transformers source.
+-e ./vendor/transformers
+
+# Runtime / model loading
+accelerate
+safetensors
+sentencepiece
+protobuf
+huggingface_hub
+
+# Config / data
+pyyaml
+pandas
+
+# Visualization
+matplotlib
+pillow

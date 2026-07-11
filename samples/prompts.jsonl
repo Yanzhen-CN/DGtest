@@ -1,0 +1,4 @@
+{"id":"math_answer_first","prompt":"How many square numbers are there between 400 and 800? State your answer first, then give your reasoning."}
+{"id":"math_17x19","prompt":"Compute 17 * 19. Give the final answer first, then one short explanation."}
+{"id":"length_5_words","prompt":"Answer with exactly five words: why do leaves change color?"}
+{"id":"json_person","prompt":"Return exactly one JSON object with keys \"name\", \"age\", and \"city\" for a fictional person."}

@@ -1,0 +1,46 @@
+# DiffusionGemma self-conditioning strength sweep
+
+model_id: google/diffusiongemma-26B-A4B-it
+
+paths:
+  transformers_generation_file: vendor/transformers/src/transformers/models/diffusion_gemma/generation_diffusion_gemma.py
+  sample_file: samples/prompts.jsonl
+  output_file: outputs/results.jsonl
+  visual_dir: visual
+
+generation:
+  max_new_tokens: 256
+  max_denoising_steps: 48
+  seed: 42
+  dtype: auto
+  device_map: auto
+  local_files_only: false
+  trace_details: true
+
+# 默认跑全部 1-5。
+# 如果只想跑部分实验，命令行加：--experiments 1,3,5
+experiments:
+  "1":
+    name: baseline
+    mode: scaled
+    alpha: 1.0
+  "2":
+    name: alpha_0.75
+    mode: scaled
+    alpha: 0.75
+  "3":
+    name: alpha_0.5
+    mode: scaled
+    alpha: 0.5
+  "4":
+    name: alpha_0.25
+    mode: scaled
+    alpha: 0.25
+  "5":
+    name: none
+    mode: none
+    alpha: null
+
+visual:
+  max_chain_tokens: 80
+  step_stride: 4

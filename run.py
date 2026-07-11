@@ -3,9 +3,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
+
+# Ensure the experiment imports the same local Transformers source that it patches.
+REPO_ROOT = Path(__file__).resolve().parent
+VENDORED_TRANSFORMERS_SRC = REPO_ROOT / "vendor" / "transformers" / "src"
+sys.path.insert(0, str(VENDORED_TRANSFORMERS_SRC))
 
 import torch
 from transformers import AutoProcessor, DiffusionGemmaForBlockDiffusion
@@ -155,9 +161,7 @@ def patch_transformers(cfg: dict[str, Any], root: Path) -> None:
     text = replace_once(text, old, new, "trace_after_renoise")
 
     old = """                processed_logits = torch.where(
-                    finished_denoising[:, None, None],
-                    self_conditioning_logits,
-                    processed_logits,
+                    finished_denoising[:, None, None], self_conditioning_logits, processed_logits
                 )
 """
     new = """                if self_conditioning_logits is not None:

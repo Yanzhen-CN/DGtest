@@ -30,3 +30,4 @@ sweep:
 visual:
   max_chain_tokens: 80
   step_stride: 1
+  mode: all

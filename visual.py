@@ -17,6 +17,9 @@ except ImportError as exc:
     raise SystemExit("[ERROR] missing dependency: pyyaml") from exc
 
 
+MASK_CHAR = "\u25a1"
+
+
 def fail(msg: str) -> None:
     raise SystemExit(f"[ERROR] {msg}")
 
@@ -70,20 +73,28 @@ def safe_mean(values: list[float | None]) -> float | None:
     return mean(xs) if xs else None
 
 
+def safe_name(value: Any) -> str:
+    text = str(value if value is not None else "none").replace(".", "p")
+    text = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in text)
+    return text.strip("_") or "none"
+
+
+def alpha_sort_key(name: str) -> float:
+    if name == "none":
+        return 9999.0
+    text = name.removeprefix("alpha_").replace("p", ".")
+    try:
+        return float(text)
+    except Exception:
+        return 9999.0
+
+
 def experiment_dirs(output_root: Path) -> list[Path]:
     dirs = []
     for path in output_root.iterdir() if output_root.exists() else []:
         if path.is_dir() and (path / "params.csv").exists() and (path / "trace.csv").exists():
             dirs.append(path)
     return sorted(dirs, key=lambda p: alpha_sort_key(p.name))
-
-
-def alpha_sort_key(name: str) -> float:
-    text = name.removeprefix("alpha_").replace("p", ".")
-    try:
-        return float(text)
-    except Exception:
-        return 9999.0
 
 
 def load_outputs(output_root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -153,9 +164,12 @@ def plot_metric(traces: list[dict[str, Any]], sample_id: str, metric: str, ylabe
     for name in names:
         rows = [r for r in subset if r.get("experiment_name") == name]
         rows.sort(key=lambda r: to_int(r.get("generation_step")) or 0)
-        xs = [to_int(r.get("generation_step")) for r in rows]
-        ys = [to_float(r.get(metric)) for r in rows]
-        pairs = [(x, y) for x, y in zip(xs, ys) if x is not None and y is not None]
+        pairs = []
+        for row in rows:
+            x = to_int(row.get("generation_step"))
+            y = to_float(row.get(metric))
+            if x is not None and y is not None:
+                pairs.append((x, y))
         if pairs:
             plt.plot([x for x, _ in pairs], [y for _, y in pairs], marker="o", linewidth=1, markersize=3, label=name)
 
@@ -167,6 +181,16 @@ def plot_metric(traces: list[dict[str, Any]], sample_id: str, metric: str, ylabe
     plt.savefig(out, dpi=180)
     plt.close()
     print(f"[OK] figure: {out}")
+
+
+def write_chart_outputs(params: list[dict[str, Any]], traces: list[dict[str, Any]], out_dir: Path) -> None:
+    chart_dir = out_dir / "chart"
+    chart_dir.mkdir(parents=True, exist_ok=True)
+    write_summary(params, traces, chart_dir)
+
+    for sample_id in sorted({str(r.get("sample_id")) for r in params}):
+        plot_metric(traces, sample_id, "accepted_count", "Accepted token count", chart_dir / f"{sample_id}_accepted_count.png")
+        plot_metric(traces, sample_id, "mean_entropy", "Mean entropy", chart_dir / f"{sample_id}_mean_entropy.png")
 
 
 def chain_rows(trace_rows: list[dict[str, Any]], max_tokens: int, stride: int) -> list[dict[str, Any]]:
@@ -191,7 +215,7 @@ def chain_rows(trace_rows: list[dict[str, Any]], max_tokens: int, stride: int) -
             canvas[pos] = token
 
         upto = min(max_tokens, len(canvas))
-        accepted_so_far = "".join("□" if canvas[i] is None else canvas[i] for i in range(upto))
+        accepted_so_far = "".join(MASK_CHAR if canvas[i] is None else canvas[i] for i in range(upto))
         out.append({
             "step": row.get("generation_step"),
             "accepted_count": row.get("accepted_count"),
@@ -220,7 +244,7 @@ pre { white-space: pre-wrap; word-break: break-word; margin: 0; font-family: Con
 """,
         "</style></head><body>",
         "<h1>DiffusionGemma self-conditioning alpha sweep</h1>",
-        "<p><b>accepted_so_far</b> is cumulative accepted text. □ means not accepted yet.</p>",
+        f"<p><b>accepted_so_far</b> is cumulative accepted text. {MASK_CHAR} means not accepted yet.</p>",
     ]
 
     for sample_id in sorted({str(r.get("sample_id")) for r in params}):
@@ -259,9 +283,101 @@ pre { white-space: pre-wrap; word-break: break-word; margin: 0; font-family: Con
     print(f"[OK] chain: {out}")
 
 
+def write_dynamic_html(trace_rows: list[dict[str, Any]], out: Path, title: str, max_tokens: int, stride: int) -> None:
+    frames = chain_rows(trace_rows, max_tokens=max_tokens, stride=stride)
+    if not frames:
+        return
+
+    frame_json = json.dumps(frames, ensure_ascii=False)
+    doc = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{html.escape(title)}</title>
+<style>
+body {{ font-family: Arial, sans-serif; margin: 24px; }}
+.wrap {{ max-width: 1100px; }}
+.meta {{ color: #555; font-size: 13px; margin-bottom: 12px; }}
+.controls {{ display: flex; gap: 8px; align-items: center; margin: 12px 0; }}
+button {{ padding: 6px 10px; }}
+input[type=range] {{ width: 360px; }}
+pre {{ white-space: pre-wrap; word-break: break-word; font-family: Consolas, monospace; border: 1px solid #ddd; padding: 12px; background: #fafafa; min-height: 120px; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>{html.escape(title)}</h1>
+<div class="meta" id="meta"></div>
+<div class="controls">
+  <button id="play">Play</button>
+  <button id="pause">Pause</button>
+  <input id="slider" type="range" min="0" max="{len(frames) - 1}" value="0">
+</div>
+<pre id="canvas"></pre>
+</div>
+<script>
+const frames = {frame_json};
+let idx = 0;
+let timer = null;
+const meta = document.getElementById("meta");
+const canvas = document.getElementById("canvas");
+const slider = document.getElementById("slider");
+function show(i) {{
+  idx = Math.max(0, Math.min(frames.length - 1, i));
+  const f = frames[idx];
+  slider.value = idx;
+  meta.textContent = `frame ${{idx + 1}}/${{frames.length}} | step=${{f.step}} | accepted_count=${{f.accepted_count}} | mean_entropy=${{f.mean_entropy}}`;
+  canvas.textContent = f.accepted_so_far;
+}}
+function play() {{
+  if (timer) return;
+  timer = setInterval(() => show(idx + 1 >= frames.length ? 0 : idx + 1), 500);
+}}
+function pause() {{
+  clearInterval(timer);
+  timer = null;
+}}
+document.getElementById("play").onclick = play;
+document.getElementById("pause").onclick = pause;
+slider.oninput = () => show(Number(slider.value));
+show(0);
+</script>
+</body>
+</html>
+"""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(doc, encoding="utf-8")
+    print(f"[OK] dynamic: {out}")
+
+
+def write_dynamic_outputs(params: list[dict[str, Any]], traces: list[dict[str, Any]], out_dir: Path, max_tokens: int, stride: int) -> None:
+    dynamic_dir = out_dir / "dynamic"
+    dynamic_dir.mkdir(parents=True, exist_ok=True)
+    write_chain_html(params, traces, dynamic_dir / "chain.html", max_tokens=max_tokens, stride=stride)
+
+    by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in traces:
+        key = (str(row.get("sample_id")), str(row.get("experiment_name")))
+        by_key.setdefault(key, []).append(row)
+
+    for sample_id, experiment_name in sorted(by_key, key=lambda k: (k[0], alpha_sort_key(k[1]))):
+        out = dynamic_dir / safe_name(sample_id) / f"{safe_name(experiment_name)}.html"
+        write_dynamic_html(by_key[(sample_id, experiment_name)], out, f"{sample_id} / {experiment_name}", max_tokens=max_tokens, stride=stride)
+
+
+def resolve_mode(arg_mode: str | None, cfg: dict[str, Any]) -> str:
+    mode = (arg_mode or cfg.get("visual", {}).get("mode", "all")).lower()
+    aliases = {"charts": "chart", "animation": "dynamic"}
+    mode = aliases.get(mode, mode)
+    if mode not in {"chart", "dynamic", "all"}:
+        fail("visual mode must be one of: chart, dynamic, all")
+    return mode
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Visualize DiffusionGemma self-conditioning alpha sweep")
     parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("-m", "--mode", choices=["chart", "dynamic", "all", "charts", "animation"], default=None)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -270,19 +386,15 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     params, traces = load_outputs(output_root)
-    write_summary(params, traces, out_dir)
+    mode = resolve_mode(args.mode, cfg)
+    max_tokens = int(cfg["visual"].get("max_chain_tokens", 80))
+    stride = max(1, int(cfg["visual"].get("step_stride", 1)))
 
-    for sample_id in sorted({str(r.get("sample_id")) for r in params}):
-        plot_metric(traces, sample_id, "accepted_count", "Accepted token count", out_dir / f"{sample_id}_accepted_count.png")
-        plot_metric(traces, sample_id, "mean_entropy", "Mean entropy", out_dir / f"{sample_id}_mean_entropy.png")
+    if mode in {"chart", "all"}:
+        write_chart_outputs(params, traces, out_dir)
+    if mode in {"dynamic", "all"}:
+        write_dynamic_outputs(params, traces, out_dir, max_tokens=max_tokens, stride=stride)
 
-    write_chain_html(
-        params,
-        traces,
-        out_dir / "chain.html",
-        max_tokens=int(cfg["visual"].get("max_chain_tokens", 80)),
-        stride=max(1, int(cfg["visual"].get("step_stride", 1))),
-    )
     print(f"[DONE] visual outputs written to {out_dir}")
 
 

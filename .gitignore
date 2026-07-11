@@ -1,0 +1,11 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Experiment outputs
+outputs/
+visual/
+
+# Local patch backups
+vendor/transformers/src/transformers/models/diffusion_gemma/*.orig
+

@@ -4,15 +4,9 @@ import argparse
 import csv
 import html
 import json
-import sys
 from pathlib import Path
 from statistics import mean
 from typing import Any
-
-# Use the repository's Transformers source consistently with run.py.
-REPO_ROOT = Path(__file__).resolve().parent
-VENDORED_TRANSFORMERS_SRC = REPO_ROOT / "vendor" / "transformers" / "src"
-sys.path.insert(0, str(VENDORED_TRANSFORMERS_SRC))
 
 import matplotlib.pyplot as plt
 from transformers import AutoProcessor

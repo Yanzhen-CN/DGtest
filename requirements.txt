@@ -4,7 +4,7 @@ matplotlib
 
 # Vendored Transformers runtime dependencies
 huggingface-hub
-tokenizers
+tokenizers==0.22.2
 safetensors
 accelerate
 numpy

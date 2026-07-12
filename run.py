@@ -14,8 +14,9 @@ REPO_ROOT = Path(__file__).resolve().parent
 VENDORED_TRANSFORMERS_SRC = REPO_ROOT / "vendor" / "transformers" / "src"
 sys.path.insert(0, str(VENDORED_TRANSFORMERS_SRC))
 
-import torch
-from transformers import AutoProcessor, DiffusionGemmaForBlockDiffusion
+# torch and transformers are imported inside main(), after patch_transformers()
+# has updated the vendored source. Importing them here would cache the old,
+# unpatched generation module in the current Python process.
 
 try:
     import yaml
@@ -233,14 +234,7 @@ def patch_transformers(cfg: dict[str, Any], root: Path) -> None:
                 processed_logits,
             )
 """
-    if old in text:
-        text = text.replace(old, new, 1)
-        print("[PATCH] applied optional finished-branch None guard")
-    else:
-        print(
-            "[PATCH] optional finished-branch block not present in this Transformers version; "
-            "continuing without that compatibility edit"
-        )
+    text = replace_once(text, old, new, "finished_branch_none_safe")
 
     old = """        embeddings_dtype = self.model.decoder.embed_tokens.weight.dtype
         self_conditioning_logits = processed_logits.to(embeddings_dtype)
@@ -490,6 +484,13 @@ def main() -> None:
     patch_transformers(cfg, root)
     if args.patch_only:
         return
+
+    # Import only after the on-disk Transformers patch is complete.
+    # This guarantees that model.generate uses the patched implementation
+    # in this same process.
+    global torch, AutoProcessor, DiffusionGemmaForBlockDiffusion
+    import torch
+    from transformers import AutoProcessor, DiffusionGemmaForBlockDiffusion
 
     gen_cfg = cfg["generation"]
     output_root = root / cfg["paths"]["output_root"]

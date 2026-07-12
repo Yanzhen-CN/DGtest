@@ -4,6 +4,7 @@ __pycache__/
 
 # Experiment outputs
 outputs/
+eval/
 visual/
 
 # Local patch backups

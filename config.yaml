@@ -5,7 +5,7 @@ paths:
   sample_file: samples/prompts.jsonl
   output_root: outputs
   result_file: outputs/results.jsonl
-  visual_dir: visualpaths:
+  visual_dir: visualpaths
   eval_dir: eval
 
 generation:

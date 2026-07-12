@@ -5,7 +5,8 @@ paths:
   sample_file: samples/prompts.jsonl
   output_root: outputs
   result_file: outputs/results.jsonl
-  visual_dir: visual
+  visual_dir: visualpaths:
+  eval_dir: eval
 
 generation:
   max_new_tokens: 256

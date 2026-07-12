@@ -345,6 +345,135 @@ def write_compare_gifs(params: list[dict[str, Any]], traces: list[dict[str, Any]
             save_gif(imgs, sample_dir / "clean_trace_compare.gif", sample_dir / "clean_trace_final.png", fps, final_hold_seconds)
 
 
+
+def read_optional_csv(path: Path) -> list[dict[str, Any]]:
+    return read_csv(path) if path.exists() else []
+
+
+def plot_score_by_sample(scores: list[dict[str, Any]], sample_id: str, out: Path) -> None:
+    rows = [row for row in scores if str(row.get("sample_id")) == sample_id]
+    rows.sort(key=lambda row: alpha_sort_key(str(row.get("experiment"))))
+    if not rows:
+        return
+
+    names = [str(row.get("experiment")) for row in rows]
+    values = [to_float(row.get("score")) or 0.0 for row in rows]
+
+    plt.figure(figsize=(9, 5))
+    plt.bar(names, values)
+    plt.ylim(0, 10)
+    plt.xlabel("Self-conditioning setting")
+    plt.ylabel("Score")
+    plt.title(f"{sample_id}: score by self-conditioning")
+    plt.xticks(rotation=25, ha="right")
+    plt.tight_layout()
+    plt.savefig(out, dpi=180)
+    plt.close()
+    print(f"[OK] score figure: {out}")
+
+
+def plot_overall_score(summary_rows: list[dict[str, Any]], out: Path) -> None:
+    rows = sorted(summary_rows, key=lambda row: alpha_sort_key(str(row.get("experiment"))))
+    if not rows:
+        return
+    names = [str(row.get("experiment")) for row in rows]
+    values = [to_float(row.get("mean_score")) or 0.0 for row in rows]
+
+    plt.figure(figsize=(9, 5))
+    plt.bar(names, values)
+    plt.ylim(0, 10)
+    plt.xlabel("Self-conditioning setting")
+    plt.ylabel("Mean score")
+    plt.title("Overall mean score by self-conditioning")
+    plt.xticks(rotation=25, ha="right")
+    plt.tight_layout()
+    plt.savefig(out, dpi=180)
+    plt.close()
+    print(f"[OK] score figure: {out}")
+
+
+def plot_pass_rate(summary_rows: list[dict[str, Any]], out: Path) -> None:
+    rows = sorted(summary_rows, key=lambda row: alpha_sort_key(str(row.get("experiment"))))
+    if not rows:
+        return
+    names = [str(row.get("experiment")) for row in rows]
+    values = [to_float(row.get("pass_rate")) or 0.0 for row in rows]
+
+    plt.figure(figsize=(9, 5))
+    plt.bar(names, values)
+    plt.ylim(0, 1)
+    plt.xlabel("Self-conditioning setting")
+    plt.ylabel("Pass rate")
+    plt.title("Pass rate by self-conditioning")
+    plt.xticks(rotation=25, ha="right")
+    plt.tight_layout()
+    plt.savefig(out, dpi=180)
+    plt.close()
+    print(f"[OK] score figure: {out}")
+
+
+def plot_score_by_type(summary_rows: list[dict[str, Any]], out: Path) -> None:
+    if not summary_rows:
+        return
+
+    experiments = sorted(
+        {str(row.get("experiment")) for row in summary_rows},
+        key=alpha_sort_key,
+    )
+    types = sorted({str(row.get("type")) for row in summary_rows})
+    lookup = {
+        (str(row.get("experiment")), str(row.get("type"))): to_float(row.get("mean_score")) or 0.0
+        for row in summary_rows
+    }
+
+    width = 0.8 / max(1, len(types))
+    x = list(range(len(experiments)))
+
+    plt.figure(figsize=(10, 5))
+    for type_index, sample_type in enumerate(types):
+        positions = [
+            base + (type_index - (len(types) - 1) / 2) * width
+            for base in x
+        ]
+        values = [lookup.get((experiment, sample_type), 0.0) for experiment in experiments]
+        plt.bar(positions, values, width=width, label=sample_type)
+
+    plt.xticks(x, experiments, rotation=25, ha="right")
+    plt.ylim(0, 10)
+    plt.xlabel("Self-conditioning setting")
+    plt.ylabel("Mean score")
+    plt.title("Score by task type")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out, dpi=180)
+    plt.close()
+    print(f"[OK] score figure: {out}")
+
+
+def write_score_outputs(eval_dir: Path, out_dir: Path) -> None:
+    scores = read_optional_csv(eval_dir / "scores.csv")
+    summary_by_alpha = read_optional_csv(eval_dir / "summary_by_alpha.csv")
+    summary_by_type = read_optional_csv(eval_dir / "summary_by_type.csv")
+
+    if not scores:
+        print(f"[WARN] score results not found: {eval_dir / 'scores.csv'}")
+        return
+
+    score_dir = out_dir / "score"
+    score_dir.mkdir(parents=True, exist_ok=True)
+
+    plot_overall_score(summary_by_alpha, score_dir / "overall_score_by_alpha.png")
+    plot_pass_rate(summary_by_alpha, score_dir / "pass_rate_by_alpha.png")
+    plot_score_by_type(summary_by_type, score_dir / "score_by_type.png")
+
+    for sample_id in sorted({str(row.get("sample_id")) for row in scores}):
+        plot_score_by_sample(
+            scores,
+            sample_id,
+            score_dir / f"{safe_name(sample_id)}_score.png",
+        )
+
+
 def resolve_mode(arg_mode: str | None, cfg: dict[str, Any]) -> str:
     mode = (arg_mode or cfg.get("visual", {}).get("mode", "all")).lower()
     aliases = {"charts": "chart", "animation": "dynamic"}
@@ -363,6 +492,7 @@ def main() -> None:
     args = parser.parse_args()
     cfg = load_config(args.config)
     output_root = Path(cfg["paths"]["output_root"])
+    eval_dir = Path(cfg["paths"].get("eval_dir", "eval"))
     out_dir = Path(cfg["paths"].get("visual_dir", "visual"))
     out_dir.mkdir(parents=True, exist_ok=True)
     params, traces, clean_traces = load_outputs(output_root)
@@ -374,6 +504,7 @@ def main() -> None:
     final_hold_seconds = float(args.final_hold_seconds if args.final_hold_seconds is not None else visual_cfg.get("final_hold_seconds", 3))
     if mode in {"chart", "all"}:
         write_chart_outputs(params, traces, out_dir)
+        write_score_outputs(eval_dir, out_dir)
     if mode in {"dynamic", "all"}:
         write_compare_gifs(params, traces, clean_traces, out_dir, max_tokens, stride, fps, final_hold_seconds)
     print(f"[DONE] visual outputs written to {out_dir}")

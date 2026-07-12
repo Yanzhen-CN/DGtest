@@ -333,13 +333,21 @@ def trace_csv_rows(
     latency_sec: float,
     generated_text: str,
 ) -> list[dict[str, Any]]:
+    """Serialize the sampler's real canvas states without changing their meaning.
+
+    A canvas normally counts down through denoising steps, for example
+    48, 47, ..., 1. A new canvas begins only when the step counter jumps
+    upward again.
+    """
     rows: list[dict[str, Any]] = []
     canvas_index = 0
     previous_step: int | None = None
 
     for trace_index, item in enumerate(trace):
         step = int(item.get("cur_step", 0))
-        if previous_step is not None and step <= previous_step:
+
+        # Same canvas: steps count downward. New canvas: counter resets upward.
+        if previous_step is not None and step > previous_step:
             canvas_index += 1
         previous_step = step
 
@@ -352,11 +360,11 @@ def trace_csv_rows(
         entropies = (item.get("position_entropy") or [[]])[0]
         renoise_positions = (item.get("renoise_positions") or [[]])[0]
 
-        changed_tokens = [
+        accepted_tokens = [
             decode_piece(processor, accepted_canvas[p]) if 0 <= p < len(accepted_canvas) else ""
             for p in positions
         ]
-        changed_entropies = [
+        accepted_entropies = [
             entropies[p] if 0 <= p < len(entropies) else None for p in positions
         ]
 
@@ -374,7 +382,7 @@ def trace_csv_rows(
             "accepted_count": (item.get("accepted_count") or [None])[0],
             "mean_entropy": (item.get("mean_entropy") or [None])[0],
             "accepted_positions": json.dumps(positions, ensure_ascii=False),
-            "accepted_tokens": json.dumps(changed_tokens, ensure_ascii=False),
+            "accepted_tokens": json.dumps(accepted_tokens, ensure_ascii=False),
             "input_canvas_token_ids": json.dumps(input_canvas, ensure_ascii=False),
             "input_canvas_tokens": json.dumps(decode_tokens(input_canvas), ensure_ascii=False),
             "sampled_canvas_token_ids": json.dumps(sampled_canvas, ensure_ascii=False),
@@ -386,7 +394,7 @@ def trace_csv_rows(
             "argmax_token_ids": json.dumps(argmax_canvas, ensure_ascii=False),
             "argmax_tokens": json.dumps(decode_tokens(argmax_canvas), ensure_ascii=False),
             "position_entropy": json.dumps(entropies, ensure_ascii=False),
-            "accepted_position_entropy": json.dumps(changed_entropies, ensure_ascii=False),
+            "accepted_position_entropy": json.dumps(accepted_entropies, ensure_ascii=False),
             "renoise_positions": json.dumps(renoise_positions, ensure_ascii=False),
             "latency_sec": latency_sec,
             "final_output": generated_text,
@@ -395,16 +403,30 @@ def trace_csv_rows(
 
 
 def clean_trace_csv_rows(true_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Create a display-only trace from the real output canvases.
+
+    The first input canvas is treated as the initial noise state. A position is
+    shown as □ while it has never changed. Once that position changes for the
+    first time, its current real token remains visible in all later frames,
+    including later re-noising changes.
+
+    This is deliberately different from an accepted/commit trace.
+    """
     clean_rows: list[dict[str, Any]] = []
-    previous_by_canvas: dict[int, set[int]] = {}
-    initialized: set[int] = set()
+    states: dict[int, dict[str, Any]] = {}
 
     for row in true_rows:
         canvas_index = int(row["canvas_index"])
-        input_ids = json.loads(row["input_canvas_token_ids"])
-        canvas_len = len(input_ids) or 256
+        input_ids = [int(x) for x in json.loads(row["input_canvas_token_ids"])]
+        output_ids = [int(x) for x in json.loads(row["output_canvas_token_ids"])]
+        output_tokens = [str(x) for x in json.loads(row["output_canvas_tokens"])]
 
-        if canvas_index not in initialized:
+        if canvas_index not in states:
+            canvas_len = len(input_ids)
+            states[canvas_index] = {
+                "previous_ids": input_ids,
+                "ever_changed": set(),
+            }
             clean_rows.append({
                 "sample_id": row["sample_id"],
                 "experiment_name": row["experiment_name"],
@@ -413,27 +435,34 @@ def clean_trace_csv_rows(true_rows: list[dict[str, Any]]) -> list[dict[str, Any]
                 "trace_index": f"{row['trace_index']}.initial",
                 "canvas_index": canvas_index,
                 "generation_step": -1,
-                "phase": "initial_all_mask",
+                "phase": "initial_noise_masked",
                 "accepted_count": 0,
                 "accepted_positions": "[]",
                 "newly_committed_positions": "[]",
-                "unaccepted_positions": "[]",
+                "unaccepted_positions": json.dumps(list(range(canvas_len)), ensure_ascii=False),
                 "clean_canvas_tokens": json.dumps([MASK_CHAR] * canvas_len, ensure_ascii=False),
                 "clean_canvas_text": MASK_CHAR * canvas_len,
                 "mean_entropy": None,
             })
-            initialized.add(canvas_index)
-            previous_by_canvas[canvas_index] = set()
 
-        positions = [int(x) for x in json.loads(row["accepted_positions"])]
-        tokens = [str(x) for x in json.loads(row["accepted_tokens"])]
-        visible = [MASK_CHAR] * canvas_len
-        for pos, token in zip(positions, tokens):
-            if 0 <= pos < canvas_len:
-                visible[pos] = token
+        state = states[canvas_index]
+        previous_ids: list[int] = state["previous_ids"]
+        ever_changed: set[int] = state["ever_changed"]
+        canvas_len = min(len(previous_ids), len(output_ids), len(output_tokens))
 
-        current = {p for p in positions if 0 <= p < canvas_len}
-        previous = previous_by_canvas[canvas_index]
+        changed_now = {
+            i for i in range(canvas_len)
+            if output_ids[i] != previous_ids[i]
+        }
+        newly_visible = changed_now - ever_changed
+        ever_changed.update(changed_now)
+
+        visible = [
+            output_tokens[i] if i in ever_changed else MASK_CHAR
+            for i in range(canvas_len)
+        ]
+        still_initial_noise = sorted(set(range(canvas_len)) - ever_changed)
+
         clean_rows.append({
             "sample_id": row["sample_id"],
             "experiment_name": row["experiment_name"],
@@ -442,16 +471,19 @@ def clean_trace_csv_rows(true_rows: list[dict[str, Any]]) -> list[dict[str, Any]
             "trace_index": row["trace_index"],
             "canvas_index": canvas_index,
             "generation_step": row["generation_step"],
-            "phase": "accepted_state",
-            "accepted_count": row["accepted_count"],
-            "accepted_positions": json.dumps(sorted(current), ensure_ascii=False),
-            "newly_committed_positions": json.dumps(sorted(current - previous), ensure_ascii=False),
-            "unaccepted_positions": json.dumps(sorted(previous - current), ensure_ascii=False),
+            "phase": "changed_from_initial_noise",
+            # Retained for compatibility with the existing visual.py.
+            "accepted_count": len(ever_changed),
+            "accepted_positions": json.dumps(sorted(ever_changed), ensure_ascii=False),
+            "newly_committed_positions": json.dumps(sorted(newly_visible), ensure_ascii=False),
+            "unaccepted_positions": json.dumps(still_initial_noise, ensure_ascii=False),
             "clean_canvas_tokens": json.dumps(visible, ensure_ascii=False),
             "clean_canvas_text": "".join(visible),
             "mean_entropy": row["mean_entropy"],
         })
-        previous_by_canvas[canvas_index] = current
+
+        state["previous_ids"] = output_ids
+        state["ever_changed"] = ever_changed
 
     return clean_rows
 

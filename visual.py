@@ -76,6 +76,19 @@ def to_int(value: Any) -> int | None:
         return None
 
 
+def trace_order_key(row: dict[str, Any]) -> tuple[int, int]:
+    """Preserve the sampler's recorded order.
+
+    Real rows use integer trace_index values. Clean-trace initial frames use
+    values such as "0.initial" and must appear immediately before row 0.
+    """
+    raw = str(row.get("trace_index", "")).strip()
+    if raw.endswith(".initial"):
+        base = raw[:-8]
+        return (to_int(base) or 0, -1)
+    return (to_int(raw) or 0, 0)
+
+
 def safe_mean(values: list[float | None]) -> float | None:
     xs = [x for x in values if x is not None]
     return mean(xs) if xs else None
@@ -176,16 +189,15 @@ def plot_metric(traces: list[dict[str, Any]], sample_id: str, metric: str, ylabe
     plt.figure(figsize=(9, 5))
     for name in names:
         rows = [r for r in subset if str(r.get("experiment_name")) == name]
-        rows.sort(key=lambda r: to_int(r.get("generation_step")) or 0)
+        rows.sort(key=trace_order_key)
         pairs = []
-        for row in rows:
-            x = to_int(row.get("generation_step"))
+        for order_index, row in enumerate(rows):
             y = to_float(row.get(metric))
-            if x is not None and y is not None:
-                pairs.append((x, y))
+            if y is not None:
+                pairs.append((order_index, y))
         if pairs:
             plt.plot([x for x, _ in pairs], [y for _, y in pairs], marker="o", linewidth=1, markersize=3, label=name)
-    plt.xlabel("Denoising step")
+    plt.xlabel("Recorded trace order")
     plt.ylabel(ylabel)
     plt.title(f"{sample_id}: {ylabel}")
     plt.legend()
@@ -222,7 +234,7 @@ def group_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, list[dict[str,
         out.setdefault(sample, {}).setdefault(exp, []).append(row)
     for sample in out:
         for exp in out[sample]:
-            out[sample][exp].sort(key=lambda r: to_int(r.get("generation_step")) or -1)
+            out[sample][exp].sort(key=trace_order_key)
     return out
 
 
@@ -300,7 +312,7 @@ def render_compare_frame(sample_id: str, experiments: list[str], per_exp_frames:
     draw = ImageDraw.Draw(img)
     title_font = load_font(30)
     sub_font = load_font(17)
-    trace_name = "clean commit view" if clean_mode else "true sampler canvas"
+    trace_name = "initial-noise-masked view" if clean_mode else "true sampler canvas"
     draw.text((30, 20), f"{sample_id} — {trace_name}", fill=TEXT, font=title_font)
     draw.text((30, 58), f"frame {frame_index + 1}/{total_frames}", fill=MUTED, font=sub_font)
     y = 88

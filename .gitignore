@@ -3,9 +3,9 @@ __pycache__/
 *.py[cod]
 
 # Experiment outputs
-outputs/
-eval/
-visual/
+outputs*/
+eval*/
+visual*/
 
 # Local patch backups
 vendor/transformers/src/transformers/models/diffusion_gemma/*.orig

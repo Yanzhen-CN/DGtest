@@ -60,9 +60,32 @@ def experiment_dirs(output_root: Path) -> list[Path]:
     )
 
 
+SPECIAL_TOKEN_RE = re.compile(
+    r"<\|[^>\r\n]*>|<[^>\r\n]*\|>|<(?:eos|pad|bos)>",
+    flags=re.I,
+)
+
+
+def clean_generated_text(text: str) -> str:
+    """Remove DG chat/special-token artifacts before task scoring."""
+    text = SPECIAL_TOKEN_RE.sub("", text)
+    text = text.replace("\x00", "")
+    return text.strip()
+
+
 def extract_python(text: str) -> str:
+    text = clean_generated_text(text)
     blocks = re.findall(r"```(?:python)?\s*(.*?)```", text, flags=re.I | re.S)
-    return max(blocks, key=len).strip() if blocks else text.strip()
+    if blocks:
+        return max(blocks, key=len).strip()
+
+    # When the model emits prose before code, start from the first plausible
+    # Python top-level statement instead of executing the prose.
+    match = re.search(
+        r"(?m)^(?=(?:from\s+\S+\s+import|import\s+\S+|def\s+\w+|class\s+\w+))",
+        text,
+    )
+    return text[match.start():].strip() if match else text.strip()
 
 
 def run_tests(code: str, tests: list[str], timeout: float) -> tuple[bool, int, int, str]:
@@ -385,7 +408,8 @@ def main() -> None:
                 })
                 continue
 
-            text = output_file.read_text(encoding="utf-8", errors="replace")
+            raw_text = output_file.read_text(encoding="utf-8", errors="replace")
+            text = clean_generated_text(raw_text)
             rows.append({**base, **score_one(text, meta, args.timeout)})
 
     write_csv(scores_path, rows)

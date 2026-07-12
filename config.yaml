@@ -9,7 +9,7 @@ paths:
   eval_dir: eval
 
 generation:
-  max_new_tokens: 256
+  max_new_tokens: 1048
   max_denoising_steps: 48
   seed: 42
   dtype: auto

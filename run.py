@@ -233,7 +233,14 @@ def patch_transformers(cfg: dict[str, Any], root: Path) -> None:
                 processed_logits,
             )
 """
-    text = replace_once(text, old, new, "finished_branch_none_safe")
+    if old in text:
+        text = text.replace(old, new, 1)
+        print("[PATCH] applied optional finished-branch None guard")
+    else:
+        print(
+            "[PATCH] optional finished-branch block not present in this Transformers version; "
+            "continuing without that compatibility edit"
+        )
 
     old = """        embeddings_dtype = self.model.decoder.embed_tokens.weight.dtype
         self_conditioning_logits = processed_logits.to(embeddings_dtype)

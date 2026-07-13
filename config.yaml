@@ -21,8 +21,8 @@ generation:
   local_files_only: false
   # Keep Xet enabled for fast parallel download/reconstruction.
   disable_xet: false
-  # RunPod network volume. Keep model and Xet caches off the 20GB container disk.
-  cache_dir: /workspace/.cache/huggingface/hub
+  # Hugging Face's normal default-cache scheme, rooted on the RunPod network volume.
+  hf_home: /workspace/.cache/huggingface
   trace_details: true
 
 sweep:
@@ -30,6 +30,7 @@ sweep:
   # alpha > 0: next self-conditioning logits = alpha * processed_logits
   # none: self-conditioning is disabled and None is passed to decoder
   alphas:
+    - 1.0
     - 0.5
     - none
 

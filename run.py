@@ -41,31 +41,31 @@ def load_config(path: str | Path) -> dict[str, Any]:
     return cfg
 
 
-def configure_huggingface_environment(cfg: dict[str, Any], root: Path) -> Path | None:
-    """Configure Hub transfer settings before huggingface_hub is imported."""
+def configure_huggingface_environment(cfg: dict[str, Any], root: Path) -> None:
+    """Keep the standard Hub cache layout, rooted on persistent storage."""
     gen_cfg = cfg["generation"]
     if bool(gen_cfg.get("disable_xet", True)):
         os.environ["HF_HUB_DISABLE_XET"] = "1"
     else:
         os.environ.pop("HF_HUB_DISABLE_XET", None)
 
-    raw_cache_dir = gen_cfg.get("cache_dir")
-    if not raw_cache_dir:
-        return None
-    raw_cache_text = str(raw_cache_dir)
+    raw_hf_home = gen_cfg.get("hf_home")
+    if not raw_hf_home:
+        return
+    raw_cache_text = str(raw_hf_home)
     # Keep the RunPod config usable for local Windows syntax/import checks.
     if os.name == "nt" and raw_cache_text.startswith("/workspace/"):
-        cache_dir = root / ".cache" / "huggingface" / "hub"
+        hf_home = root / ".cache" / "huggingface"
     else:
-        cache_dir = Path(raw_cache_text).expanduser()
-    if not cache_dir.is_absolute():
-        cache_dir = root / cache_dir
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    # An explicit project setting must override an image-level default such as
-    # /root/.cache, which lives on RunPod's small container disk.
-    os.environ["HF_HUB_CACHE"] = str(cache_dir)
-    os.environ["HF_XET_CACHE"] = str(cache_dir.parent / "xet")
-    return cache_dir
+        hf_home = Path(raw_cache_text).expanduser()
+    if not hf_home.is_absolute():
+        hf_home = root / hf_home
+    hf_home.mkdir(parents=True, exist_ok=True)
+    os.environ["HF_HOME"] = str(hf_home)
+    # Remove explicit sub-cache overrides so huggingface_hub uses its normal
+    # $HF_HOME/hub and $HF_HOME/xet defaults, matching the original setup.
+    os.environ.pop("HF_HUB_CACHE", None)
+    os.environ.pop("HF_XET_CACHE", None)
 
 
 def safe_name(x: Any) -> str:
@@ -596,7 +596,7 @@ def main() -> None:
 
     root = Path(".").resolve()
     cfg = load_config(args.config)
-    model_cache_dir = configure_huggingface_environment(cfg, root)
+    configure_huggingface_environment(cfg, root)
 
     if args.restore_patch:
         restore_patch(cfg, root)
@@ -632,12 +632,10 @@ def main() -> None:
     print(f"[LOAD] {cfg['model_id']}")
     processor = AutoProcessor.from_pretrained(
         cfg["model_id"],
-        cache_dir=model_cache_dir,
         local_files_only=bool(gen_cfg.get("local_files_only", False)),
     )
     model = DiffusionGemmaForBlockDiffusion.from_pretrained(
         cfg["model_id"],
-        cache_dir=model_cache_dir,
         dtype=gen_cfg.get("dtype", "auto"),
         device_map=gen_cfg.get("device_map", "auto"),
         local_files_only=bool(gen_cfg.get("local_files_only", False)),

@@ -41,6 +41,23 @@ def load_config(path: str | Path) -> dict[str, Any]:
     return cfg
 
 
+def configure_huggingface_environment(cfg: dict[str, Any], root: Path) -> Path | None:
+    """Configure Hub transfer settings before huggingface_hub is imported."""
+    gen_cfg = cfg["generation"]
+    if bool(gen_cfg.get("disable_xet", True)):
+        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+    raw_cache_dir = gen_cfg.get("cache_dir")
+    if not raw_cache_dir:
+        return None
+    cache_dir = Path(str(raw_cache_dir)).expanduser()
+    if not cache_dir.is_absolute():
+        cache_dir = root / cache_dir
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("HF_HUB_CACHE", str(cache_dir))
+    return cache_dir
+
+
 def safe_name(x: Any) -> str:
     s = str(x if x is not None else "none").replace(".", "p")
     s = re.sub(r"[^A-Za-z0-9_-]+", "_", s)
@@ -569,6 +586,7 @@ def main() -> None:
 
     root = Path(".").resolve()
     cfg = load_config(args.config)
+    model_cache_dir = configure_huggingface_environment(cfg, root)
 
     if args.restore_patch:
         restore_patch(cfg, root)
@@ -604,10 +622,12 @@ def main() -> None:
     print(f"[LOAD] {cfg['model_id']}")
     processor = AutoProcessor.from_pretrained(
         cfg["model_id"],
+        cache_dir=model_cache_dir,
         local_files_only=bool(gen_cfg.get("local_files_only", False)),
     )
     model = DiffusionGemmaForBlockDiffusion.from_pretrained(
         cfg["model_id"],
+        cache_dir=model_cache_dir,
         dtype=gen_cfg.get("dtype", "auto"),
         device_map=gen_cfg.get("device_map", "auto"),
         local_files_only=bool(gen_cfg.get("local_files_only", False)),

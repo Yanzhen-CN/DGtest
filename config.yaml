@@ -7,11 +7,10 @@ paths:
   visual_dir: visual
 
 generation:
-  max_new_tokens: 256
+  max_new_tokens: 1024
   # Each step budget is run for every self-conditioning strength.
   denoising_steps:
     - 48
-    - 96
   # Keep the 48-step temperature trajectory unchanged. Longer runs remain at
   # t_min after this many chronological denoising steps.
   temperature_schedule_steps: 48
@@ -31,8 +30,6 @@ sweep:
   # none: self-conditioning is disabled and None is passed to decoder
   alphas:
     - 1.0
-    - 0.5
-    - none
 
 visual:
   max_chain_tokens: 80

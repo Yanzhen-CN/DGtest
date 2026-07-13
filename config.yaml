@@ -19,11 +19,9 @@ generation:
   dtype: auto
   device_map: auto
   local_files_only: false
-  # Xet reconstruction can fail on container/network volumes for very large
-  # checkpoints. Use regular Hub downloads, which retain partial files and
-  # resume on the next run.
-  disable_xet: true
-  # RunPod network volume. Keep the 37GB checkpoint off the 20GB container disk.
+  # Keep Xet enabled for fast parallel download/reconstruction.
+  disable_xet: false
+  # RunPod network volume. Keep model and Xet caches off the 20GB container disk.
   cache_dir: /workspace/.cache/huggingface/hub
   trace_details: true
 

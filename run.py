@@ -46,17 +46,25 @@ def configure_huggingface_environment(cfg: dict[str, Any], root: Path) -> Path |
     gen_cfg = cfg["generation"]
     if bool(gen_cfg.get("disable_xet", True)):
         os.environ["HF_HUB_DISABLE_XET"] = "1"
+    else:
+        os.environ.pop("HF_HUB_DISABLE_XET", None)
 
     raw_cache_dir = gen_cfg.get("cache_dir")
     if not raw_cache_dir:
         return None
-    cache_dir = Path(str(raw_cache_dir)).expanduser()
+    raw_cache_text = str(raw_cache_dir)
+    # Keep the RunPod config usable for local Windows syntax/import checks.
+    if os.name == "nt" and raw_cache_text.startswith("/workspace/"):
+        cache_dir = root / ".cache" / "huggingface" / "hub"
+    else:
+        cache_dir = Path(raw_cache_text).expanduser()
     if not cache_dir.is_absolute():
         cache_dir = root / cache_dir
     cache_dir.mkdir(parents=True, exist_ok=True)
     # An explicit project setting must override an image-level default such as
     # /root/.cache, which lives on RunPod's small container disk.
     os.environ["HF_HUB_CACHE"] = str(cache_dir)
+    os.environ["HF_XET_CACHE"] = str(cache_dir.parent / "xet")
     return cache_dir
 
 

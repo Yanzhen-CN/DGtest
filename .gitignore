@@ -1,6 +1,10 @@
 # Python caches
 __pycache__/
 *.py[cod]
+.venv/
+python-runtime/
+python-installer.exe
+.mplconfig/
 
 # Experiment outputs
 outputs*/

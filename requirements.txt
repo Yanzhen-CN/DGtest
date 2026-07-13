@@ -1,6 +1,7 @@
 # Direct script dependencies
 PyYAML
 matplotlib
+Pillow
 
 # Vendored Transformers runtime dependencies
 huggingface-hub

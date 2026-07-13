@@ -15,6 +15,7 @@
 
 import copy
 import math
+import os
 import sys
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -293,6 +294,12 @@ class LinearTemperatureScheduleLogitsProcessor(LogitsProcessor):
         self.t_min = t_min
         self.t_max = t_max
         self.max_denoising_steps = max_denoising_steps
+        # DGTEST_SELFCOND_STEP_SWEEP_V4: decouple temperature decay from the total step budget.
+        self.temperature_schedule_steps = int(
+            os.environ.get("DG_TEMPERATURE_SCHEDULE_STEPS", max_denoising_steps)
+        )
+        if self.temperature_schedule_steps <= 0:
+            raise ValueError("DG_TEMPERATURE_SCHEDULE_STEPS must be positive")
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, cur_step: int) -> torch.FloatTensor:
         """
@@ -312,7 +319,16 @@ class LinearTemperatureScheduleLogitsProcessor(LogitsProcessor):
         Returns:
             `torch.FloatTensor`: The logits after applying the linear temperature schedule.
         """
-        temperature = self.t_min + ((self.t_max - self.t_min) * (cur_step / self.max_denoising_steps))
+        # DGTEST_SELFCOND_STEP_SWEEP_V4: the first schedule_steps chronological iterations follow
+        # the baseline schedule; any extra budget stays at the minimum temperature.
+        elapsed_steps = self.max_denoising_steps - cur_step
+        schedule_step = torch.clamp(
+            torch.as_tensor(self.temperature_schedule_steps, device=scores.device) - elapsed_steps,
+            min=0,
+        )
+        temperature = self.t_min + (
+            (self.t_max - self.t_min) * (schedule_step / self.temperature_schedule_steps)
+        )
         return scores / temperature
 
 
@@ -1026,11 +1042,19 @@ class DiffusionGemmaGenerationMixin:
         cur_step = torch.tensor(cur_step, device=current_canvas.device, dtype=torch.int32)
         torch.compiler.cudagraph_mark_step_begin()  # needed for the compiled EB sampler
 
+        # DGTEST_SELFCOND_STEP_SWEEP_V4: self-conditioning alpha sweep.
+        dg_selfcond_mode = getattr(self, "_dg_selfcond_mode", os.environ.get("DG_SELFCOND_MODE", "scaled"))
+        dg_selfcond_mode = str(dg_selfcond_mode).lower()
+        dg_selfcond_alpha = float(getattr(self, "_dg_selfcond_alpha", os.environ.get("DG_SELFCOND_ALPHA", "1.0")))
+        if dg_selfcond_mode not in ("scaled", "none"):
+            raise ValueError(f"Unknown DG self-conditioning mode: {dg_selfcond_mode}")
+        decoder_self_conditioning_logits = None if dg_selfcond_mode == "none" else self_conditioning_logits
+
         # 1.c.i Run the decoder, taking the current canvas, the encoder KV cache, and the self-conditioning
         # logits (if available) as inputs.
         decoder_outputs = decoder_forward(
             decoder_input_ids=current_canvas,
-            self_conditioning_logits=self_conditioning_logits,
+            self_conditioning_logits=decoder_self_conditioning_logits,
             decoder_attention_mask=mask_mapping,
             past_key_values=past_key_values,
             decoder_position_ids=decoder_position_ids,
@@ -1054,21 +1078,68 @@ class DiffusionGemmaGenerationMixin:
         new_current_canvas = sampler.renoise_canvas(accepted_canvas, cur_step)
         new_current_canvas = new_current_canvas.clone()  # clone needed for compiled sampler
 
+        # DGTEST_SELFCOND_STEP_SWEEP_V4: record exact sampler states for both real and clean traces.
+        if getattr(self, "_dg_trace_enabled", False):
+            try:
+                with torch.no_grad():
+                    token_entropy = torch.distributions.Categorical(logits=processed_logits).entropy()
+                    accepted_mask = sampler.accepted_token_mask
+                    accepted_count = accepted_mask.sum(dim=-1)
+                    renoise_mask = ~accepted_mask
+                    trace_row = {
+                        "cur_step": int(cur_step.detach().cpu().item()) if torch.is_tensor(cur_step) else int(cur_step),
+                        "mode": dg_selfcond_mode,
+                        "alpha": float(dg_selfcond_alpha),
+                        "accepted_count": accepted_count.detach().cpu().tolist(),
+                        "mean_entropy": token_entropy.mean(dim=-1).detach().cpu().tolist(),
+                    }
+                    if getattr(self, "_dg_trace_details", True):
+                        trace_row.update({
+                            "accepted_positions": [
+                                torch.nonzero(row, as_tuple=False).flatten().detach().cpu().tolist()
+                                for row in accepted_mask
+                            ],
+                            "renoise_positions": [
+                                torch.nonzero(row, as_tuple=False).flatten().detach().cpu().tolist()
+                                for row in renoise_mask
+                            ],
+                            "position_entropy": token_entropy.detach().cpu().tolist(),
+                            "input_canvas_token_ids": current_canvas.detach().cpu().tolist(),
+                            "sampled_canvas_token_ids": denoiser_canvas.detach().cpu().tolist(),
+                            "accepted_canvas_token_ids": accepted_canvas.detach().cpu().tolist(),
+                            "output_canvas_token_ids": new_current_canvas.detach().cpu().tolist(),
+                            "argmax_token_ids": new_argmax_canvas.detach().cpu().tolist(),
+                        })
+                    if not hasattr(self, "_dg_trace") or self._dg_trace is None:
+                        self._dg_trace = []
+                    self._dg_trace.append(trace_row)
+            except Exception as exc:
+                self._dg_trace_error = repr(exc)
+
         # 1.c.iv Update the diffusion stopping criteria.
         if diffusion_stopping_criteria is not None:
             # If we have any batch item that has finished before, we don't want to update its results!
             if finished_denoising.any():
                 new_argmax_canvas = torch.where(finished_denoising[:, None], argmax_canvas, new_argmax_canvas)
                 new_current_canvas = torch.where(finished_denoising[:, None], current_canvas, new_current_canvas)
-                processed_logits = torch.where(
-                    finished_denoising[:, None, None], self_conditioning_logits, processed_logits
-                )
+                if self_conditioning_logits is not None:
+                    processed_logits = torch.where(
+                        finished_denoising[:, None, None],
+                        self_conditioning_logits,
+                        processed_logits,
+                    )
 
             finished_denoising |= diffusion_stopping_criteria(new_argmax_canvas, processed_logits)
 
         # 1.c.v Use the output logits as self-conditioning logits for the next step.
         embeddings_dtype = self.model.decoder.embed_tokens.weight.dtype
-        self_conditioning_logits = processed_logits.to(embeddings_dtype)
+        # DGTEST_SELFCOND_STEP_SWEEP_V4: choose next-step self-conditioning.
+        if dg_selfcond_mode == "scaled":
+            self_conditioning_logits = (processed_logits * dg_selfcond_alpha).to(embeddings_dtype)
+        elif dg_selfcond_mode == "none":
+            self_conditioning_logits = None
+        else:
+            raise ValueError(f"Unknown DG self-conditioning mode: {dg_selfcond_mode}")
 
         return (
             new_current_canvas,

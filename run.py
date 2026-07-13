@@ -128,6 +128,19 @@ def replace_once(text: str, old: str, new: str, name: str) -> str:
     return text.replace(old, new, 1)
 
 
+def replace_one_of(text: str, variants: list[tuple[str, str]], name: str) -> str:
+    """Replace exactly one of the supported upstream source variants."""
+    matches = [(old, new) for old, new in variants if text.count(old) == 1]
+    if len(matches) != 1:
+        counts = [text.count(old) for old, _ in variants]
+        fail(
+            f"patch point '{name}' expected one supported variant, found counts={counts}. "
+            "Usually this means transformers version mismatch or an older patch is present."
+        )
+    old, new = matches[0]
+    return text.replace(old, new, 1)
+
+
 def generation_file_path(cfg: dict[str, Any], root: Path) -> Path:
     return root / cfg["paths"]["transformers_generation_file"]
 
@@ -277,18 +290,40 @@ def patch_transformers(cfg: dict[str, Any], root: Path) -> None:
 """
     text = replace_once(text, old, new, "trace_after_renoise")
 
-    old = """        processed_logits = torch.where(
+    text = replace_one_of(
+        text,
+        [
+            # Source layout used by commit ed01d309 and the vendored tree.
+            (
+                """                processed_logits = torch.where(
+                    finished_denoising[:, None, None], self_conditioning_logits, processed_logits
+                )
+""",
+                """                if self_conditioning_logits is not None:
+                    processed_logits = torch.where(
+                        finished_denoising[:, None, None],
+                        self_conditioning_logits,
+                        processed_logits,
+                    )
+""",
+            ),
+            # Compatibility with the earlier unguarded upstream layout.
+            (
+                """        processed_logits = torch.where(
             finished_denoising[:, None, None], self_conditioning_logits, processed_logits
         )
-"""
-    new = """        if self_conditioning_logits is not None:
+""",
+                """        if self_conditioning_logits is not None:
             processed_logits = torch.where(
                 finished_denoising[:, None, None],
                 self_conditioning_logits,
                 processed_logits,
             )
-"""
-    text = replace_once(text, old, new, "finished_branch_none_safe")
+""",
+            ),
+        ],
+        "finished_branch_none_safe",
+    )
 
     old = """        embeddings_dtype = self.model.decoder.embed_tokens.weight.dtype
         self_conditioning_logits = processed_logits.to(embeddings_dtype)

@@ -4,13 +4,17 @@ paths:
   transformers_generation_file: vendor/transformers/src/transformers/models/diffusion_gemma/generation_diffusion_gemma.py
   sample_file: samples/prompts.jsonl
   output_root: outputs
-  result_file: outputs/results.jsonl
-  visual_dir: visualpaths
-  eval_dir: eval
+  visual_dir: visual
 
 generation:
-  max_new_tokens: 1048
-  max_denoising_steps: 48
+  max_new_tokens: 256
+  # Each step budget is run for every self-conditioning strength.
+  denoising_steps:
+    - 48
+    - 96
+  # Keep the 48-step temperature trajectory unchanged. Longer runs remain at
+  # t_min after this many chronological denoising steps.
+  temperature_schedule_steps: 48
   seed: 42
   dtype: auto
   device_map: auto
@@ -23,9 +27,7 @@ sweep:
   # none: self-conditioning is disabled and None is passed to decoder
   alphas:
     - 1.0
-    - 0.75
     - 0.5
-    - 0.25
     - none
 
 visual:

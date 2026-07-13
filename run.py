@@ -24,9 +24,7 @@ except ImportError as exc:
     raise SystemExit("[ERROR] missing dependency: pyyaml") from exc
 
 
-PATCH_MARKER = "DGTEST_DUAL_CANVAS_TRACE_V3"
-MASK_CHAR = "□"
-
+PATCH_MARKER = "DGTEST_SELFCOND_STEP_SWEEP_V4"
 
 def fail(msg: str) -> None:
     raise SystemExit(f"[ERROR] {msg}")
@@ -55,7 +53,7 @@ def format_alpha(alpha: float) -> str:
 
 
 def alpha_name(alpha: float | None) -> str:
-    return "none" if alpha is None else f"alpha_{format_alpha(alpha)}"
+    return "alphanone" if alpha is None else f"alpha{format_alpha(alpha)}"
 
 
 def alpha_mode(alpha: float | None) -> str:
@@ -89,12 +87,35 @@ def selected_alphas(arg: str | None, cfg: dict[str, Any]) -> list[float | None]:
     return parse_alpha_values(arg if arg else cfg["sweep"].get("alphas"))
 
 
+def parse_step_values(raw: Any) -> list[int]:
+    if raw is None:
+        fail("generation.denoising_steps is required")
+    values = [x.strip() for x in raw.split(",") if x.strip()] if isinstance(raw, str) else raw
+    if not isinstance(values, (list, tuple)):
+        fail("generation.denoising_steps must be a list or comma-separated string")
+    try:
+        steps = [int(value) for value in values]
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"[ERROR] bad denoising step value in: {values!r}") from exc
+    if not steps or any(step <= 0 for step in steps):
+        fail("all denoising step budgets must be positive integers")
+    return list(dict.fromkeys(steps))
+
+
 def experiment_for_alpha(alpha: float | None) -> dict[str, Any]:
     return {"name": alpha_name(alpha), "alpha": alpha, "mode": alpha_mode(alpha)}
 
 
-def experiment_dir(output_root: Path, exp: dict[str, Any]) -> Path:
-    return output_root / safe_name(exp["name"])
+def budget_dir(output_root: Path, canvas_length: int, steps: int) -> Path:
+    return output_root / f"len{canvas_length}" / f"step{steps}"
+
+
+def experiment_dir(output_root: Path, canvas_length: int, steps: int, exp: dict[str, Any]) -> Path:
+    return budget_dir(output_root, canvas_length, steps) / safe_name(exp["name"])
+
+
+def sample_dir(output_root: Path, canvas_length: int, steps: int, exp: dict[str, Any], sample_id: Any) -> Path:
+    return experiment_dir(output_root, canvas_length, steps, exp) / safe_name(sample_id)
 
 
 def replace_once(text: str, old: str, new: str, name: str) -> str:
@@ -150,6 +171,39 @@ def patch_transformers(cfg: dict[str, Any], root: Path) -> None:
         "import copy\nimport math\nimport os\nimport sys\n",
         "add_os_import",
     )
+
+    old = """        self.t_min = t_min
+        self.t_max = t_max
+        self.max_denoising_steps = max_denoising_steps
+"""
+    new = f"""        self.t_min = t_min
+        self.t_max = t_max
+        self.max_denoising_steps = max_denoising_steps
+        # {PATCH_MARKER}: decouple temperature decay from the total step budget.
+        self.temperature_schedule_steps = int(
+            os.environ.get("DG_TEMPERATURE_SCHEDULE_STEPS", max_denoising_steps)
+        )
+        if self.temperature_schedule_steps <= 0:
+            raise ValueError("DG_TEMPERATURE_SCHEDULE_STEPS must be positive")
+"""
+    text = replace_once(text, old, new, "temperature_schedule_init")
+
+    old = """        temperature = self.t_min + ((self.t_max - self.t_min) * (cur_step / self.max_denoising_steps))
+        return scores / temperature
+"""
+    new = f"""        # {PATCH_MARKER}: the first schedule_steps chronological iterations follow
+        # the baseline schedule; any extra budget stays at the minimum temperature.
+        elapsed_steps = self.max_denoising_steps - cur_step
+        schedule_step = torch.clamp(
+            torch.as_tensor(self.temperature_schedule_steps, device=scores.device) - elapsed_steps,
+            min=0,
+        )
+        temperature = self.t_min + (
+            (self.t_max - self.t_min) * (schedule_step / self.temperature_schedule_steps)
+        )
+        return scores / temperature
+"""
+    text = replace_once(text, old, new, "temperature_schedule_value")
 
     old = """        # 1.c.i Run the decoder, taking the current canvas, the encoder KV cache, and the self-conditioning
         # logits (if available) as inputs.
@@ -333,43 +387,67 @@ def trace_csv_rows(
     latency_sec: float,
     generated_text: str,
 ) -> list[dict[str, Any]]:
-    """Serialize the sampler's real canvas states without changing their meaning.
+    """Serialize the full sampler state and accepted-token events.
 
-    A canvas normally counts down through denoising steps, for example
-    48, 47, ..., 1. A new canvas begins only when the step counter jumps
-    upward again.
+    accepted_positions / accepted_tokens:
+        token positions and values actually accepted by the sampler.
+
+    changed_positions:
+        compatibility alias of accepted_positions. In this project, a token
+        "change" means an accepted/committed event, never a re-noise event.
+
+    output_changed_positions:
+        diagnostic-only raw canvas value changes between input and output.
+        This field includes re-noise and must not be used as commit/revision.
     """
     rows: list[dict[str, Any]] = []
     canvas_index = 0
     previous_step: int | None = None
+    acceptance_counts: dict[tuple[int, int], int] = {}
 
     for trace_index, item in enumerate(trace):
         step = int(item.get("cur_step", 0))
-
-        # Same canvas: steps count downward. New canvas: counter resets upward.
         if previous_step is not None and step > previous_step:
             canvas_index += 1
         previous_step = step
 
-        positions = (item.get("accepted_positions") or [[]])[0]
-        input_canvas = (item.get("input_canvas_token_ids") or [[]])[0]
-        sampled_canvas = (item.get("sampled_canvas_token_ids") or [[]])[0]
-        accepted_canvas = (item.get("accepted_canvas_token_ids") or [[]])[0]
-        output_canvas = (item.get("output_canvas_token_ids") or [[]])[0]
-        argmax_canvas = (item.get("argmax_token_ids") or [[]])[0]
-        entropies = (item.get("position_entropy") or [[]])[0]
-        renoise_positions = (item.get("renoise_positions") or [[]])[0]
-
-        accepted_tokens = [
-            decode_piece(processor, accepted_canvas[p]) if 0 <= p < len(accepted_canvas) else ""
-            for p in positions
+        accepted_positions = [
+            int(x) for x in (item.get("accepted_positions") or [[]])[0]
         ]
-        accepted_entropies = [
-            entropies[p] if 0 <= p < len(entropies) else None for p in positions
-        ]
+        input_canvas = list((item.get("input_canvas_token_ids") or [[]])[0])
+        sampled_canvas = list((item.get("sampled_canvas_token_ids") or [[]])[0])
+        accepted_canvas = list((item.get("accepted_canvas_token_ids") or [[]])[0])
+        output_canvas = list((item.get("output_canvas_token_ids") or [[]])[0])
+        argmax_canvas = list((item.get("argmax_token_ids") or [[]])[0])
+        entropies = list((item.get("position_entropy") or [[]])[0])
+        renoise_positions = list((item.get("renoise_positions") or [[]])[0])
 
         def decode_tokens(ids: list[Any]) -> list[str]:
             return [decode_piece(processor, int(token_id)) for token_id in ids]
+
+        accepted_tokens = [
+            decode_piece(processor, accepted_canvas[position])
+            if 0 <= position < len(accepted_canvas)
+            else ""
+            for position in accepted_positions
+        ]
+        accepted_entropies = [
+            entropies[position] if 0 <= position < len(entropies) else None
+            for position in accepted_positions
+        ]
+
+        update_ranks: list[int] = []
+        for position in accepted_positions:
+            key = (canvas_index, position)
+            rank = acceptance_counts.get(key, 0) + 1
+            acceptance_counts[key] = rank
+            update_ranks.append(rank)
+
+        output_changed_positions = [
+            position
+            for position in range(min(len(input_canvas), len(output_canvas)))
+            if int(input_canvas[position]) != int(output_canvas[position])
+        ]
 
         rows.append({
             "sample_id": sample_id,
@@ -379,128 +457,76 @@ def trace_csv_rows(
             "trace_index": trace_index,
             "canvas_index": canvas_index,
             "generation_step": step,
-            "accepted_count": (item.get("accepted_count") or [None])[0],
+            "accepted_count": len(accepted_positions),
+            "changed_count": len(accepted_positions),
             "mean_entropy": (item.get("mean_entropy") or [None])[0],
-            "accepted_positions": json.dumps(positions, ensure_ascii=False),
+            "accepted_positions": json.dumps(accepted_positions, ensure_ascii=False),
+            "changed_positions": json.dumps(accepted_positions, ensure_ascii=False),
+            "update_ranks": json.dumps(update_ranks, ensure_ascii=False),
             "accepted_tokens": json.dumps(accepted_tokens, ensure_ascii=False),
+            "output_changed_count": len(output_changed_positions),
+            "output_changed_positions": json.dumps(
+                output_changed_positions, ensure_ascii=False
+            ),
             "input_canvas_token_ids": json.dumps(input_canvas, ensure_ascii=False),
-            "input_canvas_tokens": json.dumps(decode_tokens(input_canvas), ensure_ascii=False),
+            "input_canvas_tokens": json.dumps(
+                decode_tokens(input_canvas), ensure_ascii=False
+            ),
             "sampled_canvas_token_ids": json.dumps(sampled_canvas, ensure_ascii=False),
-            "sampled_canvas_tokens": json.dumps(decode_tokens(sampled_canvas), ensure_ascii=False),
-            "accepted_canvas_token_ids": json.dumps(accepted_canvas, ensure_ascii=False),
-            "accepted_canvas_tokens": json.dumps(decode_tokens(accepted_canvas), ensure_ascii=False),
+            "sampled_canvas_tokens": json.dumps(
+                decode_tokens(sampled_canvas), ensure_ascii=False
+            ),
+            "accepted_canvas_token_ids": json.dumps(
+                accepted_canvas, ensure_ascii=False
+            ),
+            "accepted_canvas_tokens": json.dumps(
+                decode_tokens(accepted_canvas), ensure_ascii=False
+            ),
             "output_canvas_token_ids": json.dumps(output_canvas, ensure_ascii=False),
-            "output_canvas_tokens": json.dumps(decode_tokens(output_canvas), ensure_ascii=False),
+            "output_canvas_tokens": json.dumps(
+                decode_tokens(output_canvas), ensure_ascii=False
+            ),
             "argmax_token_ids": json.dumps(argmax_canvas, ensure_ascii=False),
-            "argmax_tokens": json.dumps(decode_tokens(argmax_canvas), ensure_ascii=False),
+            "argmax_tokens": json.dumps(
+                decode_tokens(argmax_canvas), ensure_ascii=False
+            ),
             "position_entropy": json.dumps(entropies, ensure_ascii=False),
-            "accepted_position_entropy": json.dumps(accepted_entropies, ensure_ascii=False),
+            "accepted_position_entropy": json.dumps(
+                accepted_entropies, ensure_ascii=False
+            ),
             "renoise_positions": json.dumps(renoise_positions, ensure_ascii=False),
             "latency_sec": latency_sec,
             "final_output": generated_text,
         })
+
     return rows
 
 
-def clean_trace_csv_rows(true_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Create a display-only trace from the real output canvases.
-
-    The first input canvas is treated as the initial noise state. A position is
-    shown as □ while it has never changed. Once that position changes for the
-    first time, its current real token remains visible in all later frames,
-    including later re-noising changes.
-
-    This is deliberately different from an accepted/commit trace.
-    """
-    clean_rows: list[dict[str, Any]] = []
-    states: dict[int, dict[str, Any]] = {}
-
-    for row in true_rows:
-        canvas_index = int(row["canvas_index"])
-        input_ids = [int(x) for x in json.loads(row["input_canvas_token_ids"])]
-        output_ids = [int(x) for x in json.loads(row["output_canvas_token_ids"])]
-        output_tokens = [str(x) for x in json.loads(row["output_canvas_tokens"])]
-
-        if canvas_index not in states:
-            canvas_len = len(input_ids)
-            states[canvas_index] = {
-                "previous_ids": input_ids,
-                "ever_changed": set(),
-            }
-            clean_rows.append({
-                "sample_id": row["sample_id"],
-                "experiment_name": row["experiment_name"],
-                "self_conditioning_alpha": row["self_conditioning_alpha"],
-                "mode": row["mode"],
-                "trace_index": f"{row['trace_index']}.initial",
-                "canvas_index": canvas_index,
-                "generation_step": -1,
-                "phase": "initial_noise_masked",
-                "accepted_count": 0,
-                "accepted_positions": "[]",
-                "newly_committed_positions": "[]",
-                "unaccepted_positions": json.dumps(list(range(canvas_len)), ensure_ascii=False),
-                "clean_canvas_tokens": json.dumps([MASK_CHAR] * canvas_len, ensure_ascii=False),
-                "clean_canvas_text": MASK_CHAR * canvas_len,
-                "mean_entropy": None,
-            })
-
-        state = states[canvas_index]
-        previous_ids: list[int] = state["previous_ids"]
-        ever_changed: set[int] = state["ever_changed"]
-        canvas_len = min(len(previous_ids), len(output_ids), len(output_tokens))
-
-        changed_now = {
-            i for i in range(canvas_len)
-            if output_ids[i] != previous_ids[i]
-        }
-        newly_visible = changed_now - ever_changed
-        ever_changed.update(changed_now)
-
-        visible = [
-            output_tokens[i] if i in ever_changed else MASK_CHAR
-            for i in range(canvas_len)
-        ]
-        still_initial_noise = sorted(set(range(canvas_len)) - ever_changed)
-
-        clean_rows.append({
-            "sample_id": row["sample_id"],
-            "experiment_name": row["experiment_name"],
-            "self_conditioning_alpha": row["self_conditioning_alpha"],
-            "mode": row["mode"],
-            "trace_index": row["trace_index"],
-            "canvas_index": canvas_index,
-            "generation_step": row["generation_step"],
-            "phase": "changed_from_initial_noise",
-            # Retained for compatibility with the existing visual.py.
-            "accepted_count": len(ever_changed),
-            "accepted_positions": json.dumps(sorted(ever_changed), ensure_ascii=False),
-            "newly_committed_positions": json.dumps(sorted(newly_visible), ensure_ascii=False),
-            "unaccepted_positions": json.dumps(still_initial_noise, ensure_ascii=False),
-            "clean_canvas_tokens": json.dumps(visible, ensure_ascii=False),
-            "clean_canvas_text": "".join(visible),
-            "mean_entropy": row["mean_entropy"],
-        })
-
-        state["previous_ids"] = output_ids
-        state["ever_changed"] = ever_changed
-
-    return clean_rows
-
-
-def clear_experiment_outputs(output_root: Path, experiments: list[dict[str, Any]]) -> None:
-    for exp in experiments:
-        exp_dir = experiment_dir(output_root, exp)
-        for filename in ("params.csv", "trace.csv", "clean_trace.csv"):
-            path = exp_dir / filename
-            if path.exists():
-                path.unlink()
+def clear_experiment_outputs(
+    output_root: Path,
+    canvas_length: int,
+    step_budgets: list[int],
+    experiments: list[dict[str, Any]],
+    samples: list[dict[str, Any]],
+) -> None:
+    for steps in step_budgets:
+        results_path = budget_dir(output_root, canvas_length, steps) / "results.jsonl"
+        if results_path.exists():
+            results_path.unlink()
+        for exp in experiments:
+            for sample in samples:
+                leaf = sample_dir(output_root, canvas_length, steps, exp, sample["id"])
+                for filename in ("params.csv", "trace.csv", "final_output.txt"):
+                    path = leaf / filename
+                    if path.exists():
+                        path.unlink()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run DiffusionGemma self-conditioning alpha sweep")
     parser.add_argument("--config", default="config.yaml")
-    parser.add_argument("--alphas", default=None, help="comma-separated values; example: 1,0.75,0.5,0.25,none")
+    parser.add_argument("--alphas", default=None, help="comma-separated values; example: 1,0.5,none")
+    parser.add_argument("--steps", default=None, help="comma-separated denoising budgets; example: 48,96")
     parser.add_argument("--samples", default=None, help="override sample_file in config")
     parser.add_argument("--restore-patch", action="store_true")
     parser.add_argument("--patch-only", action="store_true")
@@ -526,14 +552,18 @@ def main() -> None:
 
     gen_cfg = cfg["generation"]
     output_root = root / cfg["paths"]["output_root"]
-    result_file = root / cfg["paths"]["result_file"]
     output_root.mkdir(parents=True, exist_ok=True)
-    result_file.parent.mkdir(parents=True, exist_ok=True)
 
     sample_file = root / (args.samples or cfg["paths"]["sample_file"])
     samples = read_samples(sample_file)
     experiments = [experiment_for_alpha(alpha) for alpha in selected_alphas(args.alphas, cfg)]
-    clear_experiment_outputs(output_root, experiments)
+    step_budgets = parse_step_values(args.steps if args.steps else gen_cfg.get("denoising_steps"))
+    canvas_length = int(gen_cfg["max_new_tokens"])
+    schedule_steps = int(gen_cfg.get("temperature_schedule_steps", min(step_budgets)))
+    if schedule_steps <= 0:
+        fail("generation.temperature_schedule_steps must be positive")
+    os.environ["DG_TEMPERATURE_SCHEDULE_STEPS"] = str(schedule_steps)
+    clear_experiment_outputs(output_root, canvas_length, step_budgets, experiments, samples)
 
     seed = int(gen_cfg["seed"])
     print(f"[LOAD] {cfg['model_id']}")
@@ -560,7 +590,9 @@ def main() -> None:
     trace_fields = [
         "sample_id", "experiment_name", "self_conditioning_alpha", "mode",
         "trace_index", "canvas_index", "generation_step", "accepted_count",
-        "mean_entropy", "accepted_positions", "accepted_tokens",
+        "changed_count", "mean_entropy", "accepted_positions",
+        "changed_positions", "update_ranks", "accepted_tokens",
+        "output_changed_count", "output_changed_positions",
         "input_canvas_token_ids", "input_canvas_tokens",
         "sampled_canvas_token_ids", "sampled_canvas_tokens",
         "accepted_canvas_token_ids", "accepted_canvas_tokens",
@@ -568,20 +600,15 @@ def main() -> None:
         "argmax_token_ids", "argmax_tokens", "position_entropy",
         "accepted_position_entropy", "renoise_positions", "latency_sec", "final_output",
     ]
-    clean_trace_fields = [
-        "sample_id", "experiment_name", "self_conditioning_alpha", "mode",
-        "trace_index", "canvas_index", "generation_step", "phase", "accepted_count",
-        "accepted_positions", "newly_committed_positions", "unaccepted_positions",
-        "clean_canvas_tokens", "clean_canvas_text", "mean_entropy",
-    ]
 
-    per_experiment_params = {exp["name"]: [] for exp in experiments}
-    per_experiment_trace = {exp["name"]: [] for exp in experiments}
-    per_experiment_clean_trace = {exp["name"]: [] for exp in experiments}
-
-    with result_file.open("w", encoding="utf-8") as fout:
-        for sample in samples:
-            for exp in experiments:
+    for steps in step_budgets:
+        result_file = budget_dir(output_root, canvas_length, steps) / "results.jsonl"
+        result_file.parent.mkdir(parents=True, exist_ok=True)
+        run_gen_cfg = dict(gen_cfg, max_denoising_steps=steps)
+        with result_file.open("w", encoding="utf-8") as fout:
+            for sample, exp in (
+                (sample, exp) for sample in samples for exp in experiments
+            ):
                 alpha = exp["alpha"]
                 mode = exp["mode"]
                 model._dg_selfcond_mode = mode
@@ -599,13 +626,13 @@ def main() -> None:
                     torch.cuda.manual_seed_all(seed)
                     torch.cuda.synchronize()
 
-                print(f"[RUN] sample={sample['id']} {exp['name']} mode={mode}")
+                print(f"[RUN] len={canvas_length} steps={steps} sample={sample['id']} {exp['name']} mode={mode}")
                 start = time.time()
                 with torch.inference_mode():
                     output = model.generate(
                         **encoded,
-                        max_new_tokens=int(gen_cfg["max_new_tokens"]),
-                        max_denoising_steps=int(gen_cfg["max_denoising_steps"]),
+                        max_new_tokens=canvas_length,
+                        max_denoising_steps=steps,
                         disable_compile=True,
                         return_dict_in_generate=True,
                     )
@@ -642,26 +669,18 @@ def main() -> None:
                     latency_sec=latency,
                     generated_text=generated_text,
                 )
-                per_experiment_params[exp["name"]].append(params_csv_row(row, gen_cfg))
-                per_experiment_trace[exp["name"]].extend(true_rows)
-                per_experiment_clean_trace[exp["name"]].extend(clean_trace_csv_rows(true_rows))
-
-                sample_out = experiment_dir(output_root, exp) / f"{safe_name(sample['id'])}_final_output.txt"
-                sample_out.parent.mkdir(parents=True, exist_ok=True)
-                sample_out.write_text(generated_text, encoding="utf-8")
+                leaf = sample_dir(output_root, canvas_length, steps, exp, sample["id"])
+                leaf.mkdir(parents=True, exist_ok=True)
+                write_csv(leaf / "params.csv", params_fields, [params_csv_row(row, run_gen_cfg)])
+                write_csv(leaf / "trace.csv", trace_fields, true_rows)
+                (leaf / "final_output.txt").write_text(generated_text, encoding="utf-8")
 
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-    for exp in experiments:
-        exp_dir = experiment_dir(output_root, exp)
-        write_csv(exp_dir / "params.csv", params_fields, per_experiment_params[exp["name"]])
-        write_csv(exp_dir / "trace.csv", trace_fields, per_experiment_trace[exp["name"]])
-        write_csv(exp_dir / "clean_trace.csv", clean_trace_fields, per_experiment_clean_trace[exp["name"]])
-
-    print(f"[DONE] aggregate jsonl: {result_file}")
-    print(f"[DONE] per-alpha CSVs: {output_root}/alpha_*/params.csv, trace.csv and clean_trace.csv")
-    print("[NEXT] python visual.py --config config.yaml --mode dynamic")
+        print(f"[DONE] aggregate jsonl: {result_file}")
+    print(f"[DONE] experiment leaves: {output_root}/len{canvas_length}/step*/alpha*/*/")
+    print("[NEXT] python visual.py --config config.yaml --mode all")
 
 
 if __name__ == "__main__":

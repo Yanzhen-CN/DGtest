@@ -45,7 +45,7 @@ def configure_huggingface_environment(cfg: dict[str, Any], root: Path) -> Path |
     """Configure Hub transfer settings before huggingface_hub is imported."""
     gen_cfg = cfg["generation"]
     if bool(gen_cfg.get("disable_xet", True)):
-        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
 
     raw_cache_dir = gen_cfg.get("cache_dir")
     if not raw_cache_dir:
@@ -54,7 +54,9 @@ def configure_huggingface_environment(cfg: dict[str, Any], root: Path) -> Path |
     if not cache_dir.is_absolute():
         cache_dir = root / cache_dir
     cache_dir.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("HF_HUB_CACHE", str(cache_dir))
+    # An explicit project setting must override an image-level default such as
+    # /root/.cache, which lives on RunPod's small container disk.
+    os.environ["HF_HUB_CACHE"] = str(cache_dir)
     return cache_dir
 
 

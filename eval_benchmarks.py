@@ -45,6 +45,7 @@ def normalize_item(name: str, index: int, row: dict[str, Any]) -> dict[str, Any]
         }
     if name == "mbpp":
         task_id = str(row.get("task_id", index))
+        test_imports = list(row.get("test_imports", []))
         prompt = (
             "Write a correct Python solution for the task below. Return Python code only, without Markdown fences.\n\n"
             f"Task: {row['prompt'] if 'prompt' in row else row['text']}\n\n"
@@ -54,6 +55,7 @@ def normalize_item(name: str, index: int, row: dict[str, Any]) -> dict[str, Any]
             "sample_id": f"MBPP/{task_id}",
             "prompt": prompt,
             "test_list": row.get("test_list", []),
+            "test_imports": test_imports,
             "test_setup_code": row.get("test_setup_code", ""),
             "challenge_test_list": row.get("challenge_test_list", []),
             "reference": row.get("code", ""),
@@ -105,7 +107,25 @@ def extract_boxed(text: str) -> str:
 
 def extract_code(text: str) -> str:
     fenced = re.findall(r"```(?:python)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
-    return (fenced[-1] if fenced else text).strip()
+    code = (fenced[-1] if fenced else text).strip()
+    # DiffusionGemma's chat template can decode control markers as bare lines
+    # (most commonly `thought`) even with skip_special_tokens=True. They are
+    # metadata, not generated Python, and would otherwise make every official
+    # test fail with NameError before the function is reached.
+    marker = re.compile(
+        r"^\s*(?:<\/?(?:thought|analysis|answer|final)>|thought|analysis|answer|final)\s*$",
+        flags=re.IGNORECASE,
+    )
+    lines = [line for line in code.splitlines() if not marker.match(line)]
+    code = "\n".join(lines).strip()
+
+    # If the model added a short natural-language preface, begin at the first
+    # unmistakable Python declaration/import. Preserve decorators as well.
+    starters = re.compile(r"^\s*(?:@|def\s|async\s+def\s|class\s|from\s+\S+\s+import\s|import\s)")
+    for index, line in enumerate(code.splitlines()):
+        if starters.match(line):
+            return "\n".join(code.splitlines()[index:]).strip()
+    return code
 
 
 def extract_numeric_answer(text: str) -> str:
@@ -127,6 +147,9 @@ def build_code_program(benchmark: str, row: dict[str, Any]) -> str:
         source_prompt = str(row.get("source_prompt", ""))
         code = prediction if re.search(r"\bdef\s+", prediction) else source_prompt + prediction
         return f"{code}\n\n{row['test']}\ncheck({row['entry_point']})\n"
+    # Sanitized MBPP stores imports separately. They are part of the official
+    # execution context and must run before the generated code.
+    imports = list(row.get("test_imports", []))
     setup = str(row.get("test_setup_code", ""))
-    tests = list(row.get("test_list", [])) + list(row.get("challenge_test_list", []))
-    return "\n".join([setup, prediction, *tests]) + "\n"
+    tests = list(row.get("test_list", []))
+    return "\n".join([*imports, setup, prediction, *tests]) + "\n"

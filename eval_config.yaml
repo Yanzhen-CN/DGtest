@@ -26,3 +26,5 @@ generation:
 
 scoring:
   code_timeout_seconds: 10
+  # Public Math-Verify uses six decimal places for numeric equivalence.
+  math_precision: 6

@@ -1,0 +1,24 @@
+output_root: eval/outputs
+scores_root: eval/scores
+figures_root: eval/figures
+
+# Full official test splits by default. Use run_eval.py --limit N for a smoke run.
+benchmarks:
+  - humaneval
+  - mbpp
+  - gsm8k
+  - math500
+
+generation:
+  max_new_tokens: 512
+  seed: 42
+  experiments:
+    - name: alpha1-step48
+      alpha: 1.0
+      steps: 48
+    - name: alphanone-step96
+      alpha: none
+      steps: 96
+
+scoring:
+  code_timeout_seconds: 10

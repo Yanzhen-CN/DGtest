@@ -116,11 +116,23 @@ def alpha_sort_key(name: str) -> tuple[int, float]:
         return (0, 9999.0)
 
 
-def trace_order_key(row: dict[str, Any]) -> tuple[int, int]:
+def trace_index_key(row: dict[str, Any]) -> tuple[int, int]:
+    """Order rows inside one canvas, keeping an optional `.initial` row first."""
     raw = str(row.get("trace_index", "")).strip()
     if raw.endswith(".initial"):
         return (to_int(raw[:-8]) or 0, -1)
     return (to_int(raw) or 0, 0)
+
+
+def trace_order_key(row: dict[str, Any]) -> tuple[int, int, int]:
+    """Chronological order for current multi-canvas traces.
+
+    New traces already contain a reliable canvas_index.  Sort by it first;
+    trace_index may restart at zero for every canvas.
+    """
+    canvas = to_int(row.get("canvas_index"))
+    trace_index, initial_rank = trace_index_key(row)
+    return (canvas if canvas is not None else 0, trace_index, initial_rank)
 
 
 def load_outputs(output_root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -142,17 +154,38 @@ def load_outputs(output_root: Path) -> tuple[list[dict[str, Any]], list[dict[str
 
 
 def output_groups(output_root: Path) -> list[tuple[Path, Path]]:
-    """Return (data_dir, relative_group_dir) for each len/step experiment group."""
+    """Return experiment groups for a root, a len* directory, or a step* directory."""
+    if not output_root.exists():
+        fail(f"output root does not exist: {output_root}")
+
+    # Config may point directly at outputs/len1024/step48.
+    if output_root.name.startswith("step") and next(output_root.rglob("params.csv"), None):
+        return [(output_root, Path(output_root.parent.name) / output_root.name)]
+
+    # Or at outputs/len1024.
+    if output_root.name.startswith("len"):
+        groups = [
+            (step_dir, Path(output_root.name) / step_dir.name)
+            for step_dir in sorted(output_root.glob("step*"))
+            if step_dir.is_dir() and next(step_dir.rglob("params.csv"), None)
+        ]
+        if groups:
+            return groups
+
+    # Or at the common outputs root.
     groups: list[tuple[Path, Path]] = []
-    if output_root.exists():
-        for length_dir in sorted(output_root.glob("len*")):
-            if not length_dir.is_dir():
-                continue
-            for step_dir in sorted(length_dir.glob("step*")):
-                if step_dir.is_dir() and next(step_dir.rglob("params.csv"), None):
-                    groups.append((step_dir, step_dir.relative_to(output_root)))
+    for length_dir in sorted(output_root.glob("len*")):
+        if not length_dir.is_dir():
+            continue
+        for step_dir in sorted(length_dir.glob("step*")):
+            if step_dir.is_dir() and next(step_dir.rglob("params.csv"), None):
+                groups.append((step_dir, step_dir.relative_to(output_root)))
+
     if not groups:
-        fail(f"no len*/step* experiment groups found under: {output_root}")
+        # Last-resort support for an arbitrary directory that directly contains runs.
+        if next(output_root.rglob("params.csv"), None):
+            return [(output_root, Path(output_root.name))]
+        fail(f"no experiment groups found under: {output_root}")
     return groups
 
 
@@ -171,24 +204,40 @@ def group_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, list[dict[str,
 
 
 def normalize_canvas_indices(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Recompute canvas indices from the actual DG step reset pattern.
+    """Return rows in true canvas order and attach `_canvas_index`.
 
-    DG counts down inside one canvas. A new canvas begins only when the
-    generation step jumps upward. This avoids trusting older trace.csv files
-    whose canvas_index column may have been produced by the earlier bad rule.
+    Current DG traces explicitly record canvas_index, so this value must be
+    trusted.  The old visualizer ignored it and tried to infer canvases only
+    from generation_step resets; that collapses/interleaves 4-canvas traces
+    whenever trace_index restarts or the step sequence is not a clean reset.
+
+    For legacy traces without canvas_index, retain the step-reset fallback.
     """
-    ordered = [dict(row) for row in sorted(rows, key=trace_order_key)]
+    copied = [dict(row) for row in rows]
+    explicit = [to_int(row.get("canvas_index")) for row in copied]
+
+    if any(value is not None for value in explicit):
+        for row, value in zip(copied, explicit):
+            row["_canvas_index"] = value if value is not None else 0
+        copied.sort(
+            key=lambda row: (
+                to_int(row.get("_canvas_index")) or 0,
+                *trace_index_key(row),
+            )
+        )
+        return copied
+
+    # Legacy fallback: preserve trace order, then detect a countdown reset.
+    copied.sort(key=lambda row: trace_index_key(row))
     canvas_index = 0
     previous_step: int | None = None
-
-    for row in ordered:
+    for row in copied:
         step = to_int(row.get("generation_step")) or 0
         if previous_step is not None and step > previous_step:
             canvas_index += 1
         row["_canvas_index"] = canvas_index
         previous_step = step
-
-    return ordered
+    return copied
 
 
 def canvas_layout(rows: list[dict[str, Any]]) -> tuple[dict[int, int], dict[int, int], int]:
@@ -208,6 +257,74 @@ def canvas_layout(rows: list[dict[str, Any]]) -> tuple[dict[int, int], dict[int,
         offsets[canvas] = total
         total += lengths[canvas]
     return lengths, offsets, total
+
+
+
+
+def canvas_boundaries(rows: list[dict[str, Any]]) -> tuple[list[int], list[tuple[int, int, int]], int]:
+    """Return global token boundaries and (canvas, start, end) ranges."""
+    ordered = normalize_canvas_indices(rows)
+    lengths, offsets, total_tokens = canvas_layout(ordered)
+    ranges = [
+        (canvas, offsets[canvas], offsets[canvas] + lengths[canvas])
+        for canvas in sorted(lengths)
+    ]
+    boundaries = [start for _, start, _ in ranges if start > 0]
+    return boundaries, ranges, total_tokens
+
+
+def canvas_trace_ranges(rows: list[dict[str, Any]]) -> list[tuple[int, int, int]]:
+    """Return chronological trace index ranges for each canvas."""
+    ordered = normalize_canvas_indices(rows)
+    if not ordered:
+        return []
+
+    result: list[tuple[int, int, int]] = []
+    start = 0
+    current = to_int(ordered[0].get("_canvas_index")) or 0
+    for index, row in enumerate(ordered[1:], start=1):
+        canvas = to_int(row.get("_canvas_index")) or 0
+        if canvas != current:
+            result.append((current, start, index - 1))
+            current = canvas
+            start = index
+    result.append((current, start, len(ordered) - 1))
+    return result
+
+
+def draw_token_canvas_separators(
+    ax: Any,
+    ranges: list[tuple[int, int, int]],
+    label_y: float,
+) -> None:
+    """Draw subtle canvas boundaries and labels on token-position plots."""
+    for canvas, start, end in ranges:
+        if start > 0:
+            ax.axvline(start - 0.5, color="0.45", linestyle="--", linewidth=1.1, alpha=0.75)
+        center = (start + end - 1) / 2
+        ax.text(
+            center, label_y, f"C{canvas}",
+            ha="center", va="bottom", fontsize=9, color="0.35",
+            clip_on=False,
+        )
+
+
+def draw_step_canvas_separators(
+    axes: Any,
+    ranges: list[tuple[int, int, int]],
+) -> None:
+    """Draw subtle canvas boundaries and labels on chronological speed plots."""
+    for ax in axes:
+        ymin, ymax = ax.get_ylim()
+        label_y = ymax - 0.03 * (ymax - ymin if ymax > ymin else 1.0)
+        for canvas, start, end in ranges:
+            if start > 0:
+                ax.axvline(start - 0.5, color="0.45", linestyle="--", linewidth=1.1, alpha=0.75)
+            center = (start + end) / 2
+            ax.text(
+                center, label_y, f"C{canvas}",
+                ha="center", va="top", fontsize=9, color="0.35",
+            )
 
 
 def extract_update_events(rows: list[dict[str, Any]]) -> tuple[list[dict[str, int]], int]:
@@ -293,30 +410,26 @@ def plot_position_step_figures(
     for sample_id in samples:
         experiments = sample_experiments(params, sample_id)
         event_sets: dict[str, tuple[list[dict[str, int]], int]] = {}
+        range_sets: dict[str, list[tuple[int, int, int]]] = {}
         max_step = 0
         max_tokens = 0
 
         for experiment in experiments:
-            events, total_tokens = extract_update_events(
-                grouped.get(sample_id, {}).get(experiment, [])
-            )
+            exp_rows = grouped.get(sample_id, {}).get(experiment, [])
+            events, total_tokens = extract_update_events(exp_rows)
+            _, ranges, _ = canvas_boundaries(exp_rows)
             event_sets[experiment] = (events, total_tokens)
+            range_sets[experiment] = ranges
             max_tokens = max(max_tokens, total_tokens)
             if events:
                 max_step = max(max_step, max(event["trace_step"] for event in events))
 
         cols = min(3, max(1, len(experiments)))
         rows_n = math.ceil(len(experiments) / cols)
-        norm = Normalize(vmin=0, vmax=max(1, max_step))
 
-        # First-change order.
         fig, axes = plt.subplots(
-            rows_n,
-            cols,
-            figsize=(5.2 * cols, 3.8 * rows_n),
-            squeeze=False,
-            sharex=True,
-            sharey=True,
+            rows_n, cols, figsize=(5.2 * cols, 3.8 * rows_n),
+            squeeze=False, sharex=True, sharey=True,
         )
         for ax in axes.ravel()[len(experiments):]:
             ax.set_axis_off()
@@ -325,39 +438,30 @@ def plot_position_step_figures(
             events, _ = event_sets[experiment]
             first = [event for event in events if event["update_rank"] == 1]
             if first:
-                x = [event["global_position"] for event in first]
-                y = [event["trace_step"] for event in first]
                 ax.scatter(
-                    x,
-                    y,
-                    color="#2b6cb0",
-                    s=18,
-                    alpha=0.90,
-                    linewidths=0,
+                    [event["global_position"] for event in first],
+                    [event["trace_step"] for event in first],
+                    color="#2b6cb0", s=18, alpha=0.90, linewidths=0,
                 )
             ax.set_xlim(-1, max_tokens)
             ax.set_ylim(-1, max_step + 1)
             ax.set_title(experiment)
-            ax.set_xlabel("Token position")
+            ax.set_xlabel("Global token position")
             ax.set_ylabel("First accepted step")
+            draw_token_canvas_separators(ax, range_sets[experiment], max_step + 0.25)
             ax.grid(True, alpha=0.22)
 
         fig.suptitle(f"{sample_id}: token position vs first accepted step")
-        fig.tight_layout(rect=[0, 0, 0.97, 0.96])
+        fig.tight_layout(rect=[0, 0, 0.97, 0.94])
         path = out_dir / "trace_distribution" / f"{safe_name(sample_id)}_first_accept.png"
         path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(path, dpi=220)
+        fig.savefig(path, dpi=220, bbox_inches="tight")
         plt.close(fig)
         print(f"[OK] wrote {path}")
 
-        # Every update.
         fig, axes = plt.subplots(
-            rows_n,
-            cols,
-            figsize=(5.2 * cols, 3.8 * rows_n),
-            squeeze=False,
-            sharex=True,
-            sharey=True,
+            rows_n, cols, figsize=(5.2 * cols, 3.8 * rows_n),
+            squeeze=False, sharex=True, sharey=True,
         )
         for ax in axes.ravel()[len(experiments):]:
             ax.set_axis_off()
@@ -376,27 +480,22 @@ def plot_position_step_figures(
         for ax, experiment in zip(axes.ravel(), experiments):
             events, _ = event_sets[experiment]
             if events:
-                x = [event["global_position"] for event in events]
-                y = [event["trace_step"] for event in events]
                 ranks = [event["update_rank"] for event in events]
-                sizes = [16 + 3 * min(rank - 1, 8) for rank in ranks]
-                color_values = ranks if max_rank > 1 else [1.0] * len(ranks)
                 mappable = ax.scatter(
-                    x,
-                    y,
-                    c=color_values,
-                    cmap=count_cmap,
-                    norm=rank_norm,
-                    s=sizes,
-                    alpha=0.96,
-                    linewidths=0,
+                    [event["global_position"] for event in events],
+                    [event["trace_step"] for event in events],
+                    c=ranks if max_rank > 1 else [1.0] * len(ranks),
+                    cmap=count_cmap, norm=rank_norm,
+                    s=[16 + 3 * min(rank - 1, 8) for rank in ranks],
+                    alpha=0.96, linewidths=0,
                 )
 
             ax.set_xlim(-1, max_tokens)
             ax.set_ylim(-1, max_step + 1)
             ax.set_title(experiment)
-            ax.set_xlabel("Token position")
+            ax.set_xlabel("Global token position")
             ax.set_ylabel("Accepted / revision step")
+            draw_token_canvas_separators(ax, range_sets[experiment], max_step + 0.25)
             ax.grid(True, alpha=0.22)
 
             write_events_csv(
@@ -406,25 +505,19 @@ def plot_position_step_figures(
             )
 
         if mappable is not None:
-            cbar = fig.colorbar(
-                mappable,
-                ax=axes.ravel().tolist(),
-                fraction=0.018,
-                pad=0.02,
-            )
+            cbar = fig.colorbar(mappable, ax=axes.ravel().tolist(), fraction=0.018, pad=0.02)
             cbar.set_label("Cumulative acceptance / revision count (log scale)")
             ticks = count_ticks(max_rank)
             cbar.set_ticks(ticks)
             cbar.set_ticklabels([str(tick) for tick in ticks])
 
         fig.suptitle(f"{sample_id}: token position vs every accepted/revision step")
-        fig.tight_layout(rect=[0, 0, 0.97, 0.96])
+        fig.tight_layout(rect=[0, 0, 0.97, 0.94])
         path = out_dir / "trace_distribution" / f"{safe_name(sample_id)}_all_updates.png"
         path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(path, dpi=220)
+        fig.savefig(path, dpi=220, bbox_inches="tight")
         plt.close(fig)
         print(f"[OK] wrote {path}")
-
 
 def speed_records(
     params: list[dict[str, Any]],
@@ -478,66 +571,57 @@ def plot_speed_figures(
     for sample_id in samples:
         experiments = sample_experiments(params, sample_id)
 
-        fig, axes = plt.subplots(3, 1, figsize=(10.5, 11.5), sharex=False)
-
+        # One three-row figure per experiment. This keeps each experiment's
+        # canvas boundaries exact even when alpha1 and none use different steps.
         for experiment in experiments:
-            rows = true_grouped.get(sample_id, {}).get(experiment, [])
-            rows = sorted(rows, key=trace_order_key)
+            rows = normalize_canvas_indices(
+                true_grouped.get(sample_id, {}).get(experiment, [])
+            )
+            if not rows:
+                continue
+
             accepted = [to_float(row.get("accepted_count")) or 0.0 for row in rows]
             changed = [
                 len(parse_json_list(row.get("changed_positions")))
                 if str(row.get("changed_positions", "")).strip()
-                else len(extract_update_events([row])[0])
+                else len(parse_json_list(row.get("accepted_positions")))
                 for row in rows
             ]
-
-            axes[0].plot(
-                range(len(accepted)), accepted,
-                marker="o", markersize=3, linewidth=1.3,
-                label=experiment,
-            )
-            axes[1].plot(
-                range(len(changed)), changed,
-                marker="o", markersize=3, linewidth=1.3,
-                label=experiment,
-            )
 
             events, _ = extract_update_events(rows)
             visible_by_step: list[float] = []
             seen: set[int] = set()
             events_by_step: dict[int, list[int]] = {}
             for event in events:
-                events_by_step.setdefault(event["trace_step"], []).append(
-                    event["global_position"]
-                )
+                events_by_step.setdefault(event["trace_step"], []).append(event["global_position"])
             for step_index in range(len(rows)):
                 seen.update(events_by_step.get(step_index, []))
                 visible_by_step.append(float(len(seen)))
-            axes[2].plot(
-                range(len(visible_by_step)), visible_by_step,
-                marker="o", markersize=3, linewidth=1.3,
-                label=experiment,
-            )
 
-        axes[0].set_title("Accepted tokens per decoder step")
-        axes[0].set_ylabel("Accepted tokens")
-        axes[1].set_title("Accepted positions per step")
-        axes[1].set_ylabel("Accepted positions")
-        axes[2].set_title("Positions accepted at least once")
-        axes[2].set_ylabel("Cumulative accepted positions")
-        axes[2].set_xlabel("Chronological trace step")
+            fig, axes = plt.subplots(3, 1, figsize=(10.5, 11.5), sharex=True)
+            axes[0].plot(range(len(accepted)), accepted, marker="o", markersize=3, linewidth=1.3)
+            axes[1].plot(range(len(changed)), changed, marker="o", markersize=3, linewidth=1.3)
+            axes[2].plot(range(len(visible_by_step)), visible_by_step, marker="o", markersize=3, linewidth=1.3)
 
-        for ax in axes:
-            ax.grid(True, alpha=0.25)
-            ax.legend()
+            axes[0].set_title("Accepted tokens per decoder step")
+            axes[0].set_ylabel("Accepted tokens")
+            axes[1].set_title("Accepted positions per step")
+            axes[1].set_ylabel("Accepted positions")
+            axes[2].set_title("Positions accepted at least once")
+            axes[2].set_ylabel("Cumulative accepted positions")
+            axes[2].set_xlabel("Chronological trace step")
 
-        fig.suptitle(sample_id)
-        fig.tight_layout(rect=[0, 0, 1, 0.97])
-        path = out_dir / "speed" / f"{safe_name(sample_id)}_speed.png"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(path, dpi=220)
-        plt.close(fig)
-        print(f"[OK] wrote {path}")
+            for ax in axes:
+                ax.grid(True, alpha=0.25)
+            draw_step_canvas_separators(axes, canvas_trace_ranges(rows))
+
+            fig.suptitle(f"{sample_id} — {experiment}")
+            fig.tight_layout(rect=[0, 0, 1, 0.96])
+            path = out_dir / "speed" / f"{safe_name(sample_id)}_{safe_name(experiment)}_speed.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(path, dpi=220, bbox_inches="tight")
+            plt.close(fig)
+            print(f"[OK] wrote {path}")
 
     records = speed_records(params, traces)
     by_experiment: dict[str, list[dict[str, Any]]] = {}
@@ -550,18 +634,10 @@ def plot_speed_figures(
         summary.append({
             "experiment": experiment,
             "mean_steps": safe_mean([float(row["steps"]) for row in group]) or 0.0,
-            "mean_accepted_per_step": safe_mean(
-                [float(row["mean_accepted_per_step"]) for row in group]
-            ) or 0.0,
-            "mean_accepted_event_positions_per_step": safe_mean(
-                [float(row["mean_accepted_event_positions_per_step"]) for row in group]
-            ) or 0.0,
-            "mean_latency_sec": safe_mean(
-                [float(row["latency_sec"]) for row in group]
-            ) or 0.0,
-            "mean_tokens_per_second": safe_mean(
-                [float(row["tokens_per_second"]) for row in group]
-            ) or 0.0,
+            "mean_accepted_per_step": safe_mean([float(row["mean_accepted_per_step"]) for row in group]) or 0.0,
+            "mean_accepted_event_positions_per_step": safe_mean([float(row["mean_accepted_event_positions_per_step"]) for row in group]) or 0.0,
+            "mean_latency_sec": safe_mean([float(row["latency_sec"]) for row in group]) or 0.0,
+            "mean_tokens_per_second": safe_mean([float(row["tokens_per_second"]) for row in group]) or 0.0,
         })
 
     summary_path = out_dir / "speed" / "summary.csv"
@@ -595,7 +671,6 @@ def plot_speed_figures(
         fig.savefig(path, dpi=220)
         plt.close(fig)
         print(f"[OK] wrote {path}")
-
 
 def load_font(size: int, mono: bool = False) -> ImageFont.ImageFont:
     candidates = (
@@ -776,6 +851,10 @@ def build_true_frames(
                 "max_accept_count": global_max_accept_count,
                 "previous_changed": [],
                 "total_tokens": total_tokens,
+                "canvas_lengths": dict(lengths),
+                "canvas_offsets": dict(offsets),
+                "started_canvases": sorted(current),
+                "active_canvas": canvas,
             })
 
         output_tokens = [
@@ -816,6 +895,10 @@ def build_true_frames(
             "max_accept_count": global_max_accept_count,
             "previous_changed": list(previous_changed),
             "total_tokens": total_tokens,
+            "canvas_lengths": dict(lengths),
+            "canvas_offsets": dict(offsets),
+            "started_canvases": sorted(current),
+            "active_canvas": canvas,
         })
 
         previous_changed = list(accepted_global)
@@ -837,6 +920,10 @@ def aligned_frame(frames: list[dict[str, Any]], index: int) -> dict[str, Any]:
             "max_accept_count": 0,
             "previous_changed": [],
             "total_tokens": 0,
+            "canvas_lengths": {},
+            "canvas_offsets": {},
+            "started_canvases": [],
+            "active_canvas": None,
         }
     return frames[min(index, len(frames) - 1)]
 
@@ -860,6 +947,12 @@ def draw_token_panel(
     title: str,
     frame: dict[str, Any],
 ) -> None:
+    """Draw one experiment with every 256-token canvas in one panel.
+
+    For four canvases, the grids are stacked vertically and separated by a
+    labelled boundary.  Completed canvases remain visible while the active
+    canvas denoises; future canvases stay blank until their first trace row.
+    """
     draw = ImageDraw.Draw(image)
     x0, y0, x1, y1 = box
     draw.rounded_rectangle(box, radius=10, fill=PANEL_BG, outline=BORDER, width=2)
@@ -868,12 +961,15 @@ def draw_token_panel(
     meta_font = load_font(15)
     token_font = load_font(13, mono=True)
     index_font = load_font(9, mono=True)
+    canvas_font = load_font(14)
 
     draw.text((x0 + 14, y0 + 10), title, fill=TEXT, font=title_font)
     entropy = frame.get("mean_entropy")
     entropy_text = "" if entropy is None else f"{entropy:.4f}"
+    active_canvas = frame.get("active_canvas")
+    canvas_text = "" if active_canvas is None else f"canvas={active_canvas}   "
     meta = (
-        f"step={frame.get('step')}   "
+        f"{canvas_text}local_step={frame.get('step')}   "
         f"accepted={frame.get('accepted_count')}   "
         f"entropy={entropy_text}"
     )
@@ -884,8 +980,61 @@ def draw_token_panel(
     total_tokens = max(len(tokens), int(frame.get("total_tokens", 0)))
     cols, rows, cell_w, cell_h = token_grid_geometry(total_tokens)
 
-    grid_x = x0 + 14
+    canvas_lengths = {
+        int(k): int(v) for k, v in dict(frame.get("canvas_lengths", {})).items()
+    }
+    canvas_offsets = {
+        int(k): int(v) for k, v in dict(frame.get("canvas_offsets", {})).items()
+    }
+    if not canvas_lengths and total_tokens:
+        # Legacy/single-canvas trace.
+        canvas_lengths = {0: total_tokens}
+        canvas_offsets = {0: 0}
+
+    started_canvases = set(int(x) for x in frame.get("started_canvases", []))
+    multi_canvas = len(canvas_lengths) > 1
+    left_gutter = 68 if multi_canvas else 0
+    grid_x = x0 + 14 + left_gutter
     grid_y = y0 + 70
+
+    count_map = {
+        int(k): int(v)
+        for k, v in dict(frame.get("accept_count_map", {})).items()
+    }
+    max_accept_count = int(frame.get("max_accept_count", 0) or 0)
+    previous_changed = set(int(x) for x in frame.get("previous_changed", []))
+
+    # Map global positions back to canvas-local positions.
+    canvas_ranges = [
+        (canvas, canvas_offsets[canvas], canvas_offsets[canvas] + length)
+        for canvas, length in sorted(canvas_lengths.items())
+    ]
+
+    def position_info(index: int) -> tuple[int, int]:
+        for canvas, start_pos, end_pos in canvas_ranges:
+            if start_pos <= index < end_pos:
+                return canvas, index - start_pos
+        return 0, index
+
+    # Canvas labels and boundaries.
+    for canvas, start_pos, end_pos in canvas_ranges:
+        start_row = start_pos // cols
+        label_y = grid_y + start_row * cell_h + 4
+        label_fill = STRIP_CURRENT_MARK if canvas == active_canvas else MUTED
+        if multi_canvas:
+            draw.text(
+                (x0 + 16, label_y),
+                f"Canvas {canvas}",
+                fill=label_fill,
+                font=canvas_font,
+            )
+        if start_pos > 0:
+            boundary_y = grid_y + start_row * cell_h - 3
+            draw.line(
+                (grid_x, boundary_y, grid_x + cols * cell_w - 2, boundary_y),
+                fill=STRIP_BORDER,
+                width=3,
+            )
 
     for index in range(total_tokens):
         row = index // cols
@@ -895,21 +1044,15 @@ def draw_token_panel(
         cx1 = cx0 + cell_w - 2
         cy1 = cy0 + cell_h - 2
 
+        canvas, local_index = position_info(index)
+        canvas_started = canvas in started_canvases
         token = tokens[index] if index < len(tokens) else ""
-        count_map = {
-            int(k): int(v)
-            for k, v in dict(frame.get("accept_count_map", {})).items()
-        }
-        max_accept_count = int(frame.get("max_accept_count", 0) or 0)
-        previous_changed = set(int(x) for x in frame.get("previous_changed", []))
         count = count_map.get(index, 0)
 
-        # Requested semantics:
-        # 1) never accepted => noisy text in its own color
-        # 2) first accepted in the current frame => green
-        # 3) next frame after first accept => black (normal stable output)
-        # 4) second or more acceptances => gradient by cumulative count
-        if token == MASK_CHAR:
+        if not canvas_started:
+            fill = MASK_FILL
+            text_fill = MUTED
+        elif token == MASK_CHAR:
             fill = MASK_FILL
             text_fill = MUTED
         elif count <= 0:
@@ -934,8 +1077,6 @@ def draw_token_panel(
             width=outline_width,
         )
 
-        # One-frame memory: a token first accepted in the previous frame but not
-        # changed now remains visually readable as a just-stabilized black token.
         if index in previous_changed and index not in changed and count == 1:
             draw.rectangle(
                 (cx0, cy0, cx1, cy1),
@@ -944,7 +1085,11 @@ def draw_token_panel(
                 width=1,
             )
 
-        draw.text((cx0 + 2, cy0 + 1), str(index), fill=MUTED, font=index_font)
+        draw.text((cx0 + 2, cy0 + 1), str(local_index), fill=MUTED, font=index_font)
+
+        # Future canvases should be visibly empty, not filled with ∅ symbols.
+        if not canvas_started:
+            continue
 
         shown = compact_token(token)
         bbox = draw.textbbox((0, 0), shown, font=token_font)
@@ -955,22 +1100,16 @@ def draw_token_panel(
         draw.text((tx, ty), shown, fill=text_fill, font=token_font)
 
     # Token-position history strip: gradient = cumulative accepted-count.
-    strip_x0 = x0 + 14
+    strip_x0 = grid_x
     strip_x1 = x1 - 14
     strip_y0 = grid_y + rows * cell_h + 14
     strip_y1 = strip_y0 + 20
 
-    changed = set(int(x) for x in frame.get("changed", []))
     revisions = set(int(x) for x in frame.get("revisions", []))
-    count_map = {
-        int(k): int(v)
-        for k, v in dict(frame.get("accept_count_map", {})).items()
-    }
-    max_accept_count = int(frame.get("max_accept_count", 0) or 0)
 
     draw.text(
         (strip_x0, strip_y0 - 18),
-        "accepted-position strip (green→cyan→blue→purple log scale: 1, 2, 4, 8, 16, 32...)",
+        "accepted-position strip (four canvases concatenated; boundaries marked)",
         fill=MUTED,
         font=meta_font,
     )
@@ -985,8 +1124,6 @@ def draw_token_panel(
             (px0, strip_y0, max(px0, px1 - 1), strip_y1),
             fill=fill,
         )
-
-        # top marker for current-step acceptance
         if index in changed:
             marker_h = 5 if index not in revisions else 8
             draw.rectangle(
@@ -994,20 +1131,26 @@ def draw_token_panel(
                 fill=STRIP_CURRENT_MARK,
             )
 
+    # Draw canvas boundaries and labels on the strip.
+    for canvas, start_pos, _ in canvas_ranges:
+        px = strip_x0 + round(start_pos * width / max(1, total_tokens))
+        if start_pos > 0:
+            draw.line((px, strip_y0, px, strip_y1), fill=STRIP_BORDER, width=2)
+        draw.text((px + 2, strip_y1 + 2), f"C{canvas}", fill=MUTED, font=index_font)
+
     draw.rectangle(
         (strip_x0, strip_y0, strip_x1, strip_y1),
         outline=STRIP_BORDER,
         width=1,
     )
     draw.text(
-        (strip_x0, strip_y1 + 5),
-        "brown text = noisy/unaccepted | green = first accept now | black = stable after first accept | green→cyan→blue→purple = more accepts/revisions | red border/top = accepted now",
+        (strip_x0, strip_y1 + 15),
+        "brown=noisy | green=first accept | black=stable | cyan/blue/purple=re-accept | red=accepted now",
         fill=MUTED,
         font=meta_font,
     )
 
-    # Fixed logarithmic color legend, now clearly showing count levels.
-    legend_y0 = strip_y1 + 28
+    legend_y0 = strip_y1 + 40
     legend_y1 = legend_y0 + 16
     legend_w = min(340, max(180, strip_x1 - strip_x0))
     legend_steps = max(2, legend_w)
@@ -1030,33 +1173,16 @@ def draw_token_panel(
         outline=STRIP_BORDER,
         width=1,
     )
+    draw.text((strip_x0, legend_y0 - 18), "count legend", fill=MUTED, font=meta_font)
 
-    draw.text(
-        (strip_x0, legend_y0 - 18),
-        "count legend",
-        fill=MUTED,
-        font=meta_font,
-    )
-
-    ticks = count_ticks(max_accept_count)
-    for tick in ticks:
-        if max_accept_count <= 1:
-            ratio = 0.0
-        else:
-            ratio = math.log(tick) / math.log(max_accept_count)
+    for tick in count_ticks(max_accept_count):
+        ratio = 0.0 if max_accept_count <= 1 else math.log(tick) / math.log(max_accept_count)
         px = strip_x0 + round(ratio * (legend_steps - 1))
         draw.line((px, legend_y1, px, legend_y1 + 5), fill=STRIP_BORDER)
-
         label = str(tick)
         bbox = draw.textbbox((0, 0), label, font=index_font)
         label_w = bbox[2] - bbox[0]
-        draw.text(
-            (px - label_w / 2, legend_y1 + 6),
-            label,
-            fill=MUTED,
-            font=index_font,
-        )
-
+        draw.text((px - label_w / 2, legend_y1 + 6), label, fill=MUTED, font=index_font)
 
 def render_compare_frame(
     sample_id: str,
@@ -1074,8 +1200,17 @@ def render_compare_frame(
         default=256,
     )
     cols, rows, cell_w, cell_h = token_grid_geometry(total_tokens)
-    panel_w = 28 + cols * cell_w
-    panel_h = 205 + rows * cell_h
+    canvas_count = max(
+        (
+            len(dict(frames[-1].get("canvas_lengths", {})))
+            for frames in per_experiment_frames.values()
+            if frames
+        ),
+        default=1,
+    )
+    left_gutter = 68 if canvas_count > 1 else 0
+    panel_w = 28 + left_gutter + cols * cell_w
+    panel_h = 225 + rows * cell_h
 
     grid_cols = min(2, max(1, len(experiments)))
     grid_rows = math.ceil(len(experiments) / grid_cols)
@@ -1091,7 +1226,7 @@ def render_compare_frame(
     draw.text((22, 16), f"{sample_id} — sampler trace", fill=TEXT, font=title_font)
     draw.text(
         (22, 53),
-        f"chronological frame {frame_index + 1}/{total_frames}; shorter runs stay on their final frame",
+        f"global frame {frame_index + 1}/{total_frames}; each canvas keeps its own local denoising steps",
         fill=MUTED,
         font=subtitle_font,
     )
@@ -1112,32 +1247,43 @@ def render_compare_frame(
     return image
 
 
-def save_gif(
-    images: list[Image.Image],
+def save_gif_streaming(
+    render_frame: Any,
+    total_frames: int,
     gif_path: Path,
     final_path: Path,
     fps: float,
     final_hold_seconds: float,
 ) -> None:
-    if not images:
+    """Write a GIF without keeping hundreds of 1024-token frames in RAM."""
+    if total_frames <= 0:
         return
+
     gif_path.parent.mkdir(parents=True, exist_ok=True)
     duration = max(40, int(round(1000 / max(0.1, fps))))
-    durations = [duration for _ in images]
+    durations = [duration for _ in range(total_frames)]
     durations[-1] = max(duration, int(round(final_hold_seconds * 1000)))
-    images[0].save(
+
+    first = render_frame(0)
+
+    def remaining_frames():
+        for frame_index in range(1, total_frames):
+            yield render_frame(frame_index)
+
+    first.save(
         gif_path,
         save_all=True,
-        append_images=images[1:],
+        append_images=remaining_frames(),
         duration=durations,
         loop=0,
         optimize=False,
         disposal=2,
     )
-    images[-1].save(final_path)
+
+    final_image = render_frame(total_frames - 1)
+    final_image.save(final_path)
     print(f"[OK] wrote {gif_path}")
     print(f"[OK] wrote {final_path}")
-
 
 def write_gifs(
     params: list[dict[str, Any]],
@@ -1179,18 +1325,18 @@ def write_gifs(
         if not total:
             continue
 
-        images = [
-            render_compare_frame(
+        def render_frame(frame_index: int) -> Image.Image:
+            return render_compare_frame(
                 sample_id,
                 experiments,
                 frames_by_experiment,
                 frame_index,
                 total,
             )
-            for frame_index in range(total)
-        ]
-        save_gif(
-            images,
+
+        save_gif_streaming(
+            render_frame,
+            total,
             sample_dir / "trace_compare.gif",
             sample_dir / "trace_final.png",
             fps,

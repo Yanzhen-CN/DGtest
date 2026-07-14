@@ -2,6 +2,8 @@
 PyYAML
 matplotlib
 Pillow
+datasets
+math-verify
 
 # Vendored Transformers runtime dependencies
 huggingface-hub

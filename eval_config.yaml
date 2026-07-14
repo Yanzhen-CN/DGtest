@@ -2,6 +2,10 @@ output_root: eval/outputs
 scores_root: eval/scores
 figures_root: eval/figures
 
+# Some public benchmark parquet files return 401 from Xet CAS on RunPod.
+# This affects dataset download only; the normal run.py model setup is unchanged.
+disable_xet_for_benchmarks: true
+
 # Full official test splits by default. Use run_eval.py --limit N for a smoke run.
 benchmarks:
   - humaneval

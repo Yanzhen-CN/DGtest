@@ -44,6 +44,12 @@ def main() -> None:
     cfg = dg.load_config(args.config)
     eval_cfg = load_yaml(args.eval_config)
     dg.configure_huggingface_environment(cfg, root)
+    if bool(eval_cfg.get("disable_xet_for_benchmarks", True)):
+        # Must be set before importing transformers/datasets/huggingface_hub.
+        # Public benchmark parquet downloads occasionally fail with Xet CAS
+        # 401 on RunPod; regular Hub HTTP remains resumable and is sufficient
+        # for these small datasets.
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
     dg.patch_transformers(cfg, root)
 
     global torch

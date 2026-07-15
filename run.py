@@ -102,7 +102,7 @@ def parse_alpha_values(raw: Any) -> list[float | None]:
             alpha = float(value)
         except Exception as exc:
             raise SystemExit(f"[ERROR] bad alpha value: {value!r}") from exc
-        if alpha <= 0:
+        if alpha < 0:
             fail(f"use 'none' to disable self-conditioning; scaled alpha must be > 0, got {alpha}")
         alphas.append(alpha)
     if not alphas:

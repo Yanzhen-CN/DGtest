@@ -109,7 +109,12 @@ def safe_name(value: Any) -> str:
 def alpha_sort_key(name: str) -> tuple[int, float]:
     if name in {"none", "alphanone"}:
         return (1, 9999.0)
-    text = name.removeprefix("alpha_").removeprefix("alpha").replace("p", ".")
+    text = (
+        name.removeprefix("alpha_")
+        .removeprefix("alpha")
+        .removeprefix("scscale")
+        .replace("p", ".")
+    )
     try:
         return (0, -float(text))
     except Exception:
@@ -570,6 +575,7 @@ def plot_speed_figures(
 
     for sample_id in samples:
         experiments = sample_experiments(params, sample_id)
+        combined_series: list[tuple[str, list[float], list[float], list[float]]] = []
 
         # One three-row figure per experiment. This keeps each experiment's
         # canvas boundaries exact even when alpha1 and none use different steps.
@@ -598,6 +604,8 @@ def plot_speed_figures(
                 seen.update(events_by_step.get(step_index, []))
                 visible_by_step.append(float(len(seen)))
 
+            combined_series.append((experiment, accepted, changed, visible_by_step))
+
             fig, axes = plt.subplots(3, 1, figsize=(10.5, 11.5), sharex=True)
             axes[0].plot(range(len(accepted)), accepted, marker="o", markersize=3, linewidth=1.3)
             axes[1].plot(range(len(changed)), changed, marker="o", markersize=3, linewidth=1.3)
@@ -620,6 +628,48 @@ def plot_speed_figures(
             path = out_dir / "speed" / f"{safe_name(sample_id)}_{safe_name(experiment)}_speed.png"
             path.parent.mkdir(parents=True, exist_ok=True)
             fig.savefig(path, dpi=220, bbox_inches="tight")
+            plt.close(fig)
+            print(f"[OK] wrote {path}")
+
+        # One per-task comparison figure containing every experiment present in
+        # this length/step group. This also replaces stale pre-sweep figures.
+        if combined_series:
+            fig, axes = plt.subplots(3, 1, figsize=(10.5, 11.5), sharex=True)
+            for experiment, accepted, changed, visible_by_step in combined_series:
+                axes[0].plot(
+                    range(len(accepted)), accepted,
+                    marker="o", markersize=2.5, linewidth=1.3,
+                    label=experiment,
+                )
+                axes[1].plot(
+                    range(len(changed)), changed,
+                    marker="o", markersize=2.5, linewidth=1.3,
+                    label=experiment,
+                )
+                axes[2].plot(
+                    range(len(visible_by_step)), visible_by_step,
+                    marker="o", markersize=2.5, linewidth=1.3,
+                    label=experiment,
+                )
+
+            axes[0].set_title("Accepted tokens per decoder step")
+            axes[0].set_ylabel("Accepted tokens")
+            axes[1].set_title("Accepted positions per step")
+            axes[1].set_ylabel("Accepted positions")
+            axes[2].set_title("Positions accepted at least once")
+            axes[2].set_ylabel("Cumulative accepted positions")
+            axes[2].set_xlabel("Chronological trace step")
+            for ax in axes:
+                ax.grid(True, alpha=0.25)
+            axes[0].legend(ncol=min(4, len(combined_series)), frameon=False)
+
+            fig.suptitle(f"{sample_id} - speed and parallelism comparison")
+            fig.tight_layout(rect=[0, 0, 1, 0.96])
+            path = out_dir / "speed" / f"{safe_name(sample_id)}_summary.png"
+            legacy_path = out_dir / "speed" / f"{safe_name(sample_id)}_speed.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(path, dpi=220, bbox_inches="tight")
+            fig.savefig(legacy_path, dpi=220, bbox_inches="tight")
             plt.close(fig)
             print(f"[OK] wrote {path}")
 
@@ -1360,6 +1410,21 @@ def main() -> None:
     )
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument(
+        "--output-root",
+        default=None,
+        help="only visualize outputs under this directory, for example outputs/len256",
+    )
+    parser.add_argument(
+        "--out-dir",
+        default=None,
+        help="visual output directory (defaults to paths.visual_dir from config)",
+    )
+    parser.add_argument(
+        "--experiment-prefix",
+        default=None,
+        help="only include experiments whose names start with this prefix",
+    )
+    parser.add_argument(
         "-m", "--mode",
         choices=["chart", "dynamic", "all", "charts", "animation"],
         default=None,
@@ -1369,8 +1434,8 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    output_root = Path(cfg["paths"]["output_root"])
-    out_dir = Path(cfg["paths"].get("visual_dir", "visual"))
+    output_root = Path(args.output_root or cfg["paths"]["output_root"])
+    out_dir = Path(args.out_dir or cfg["paths"].get("visual_dir", "visual"))
     mode = resolve_mode(args.mode, cfg)
     visual_cfg = cfg.get("visual", {})
     stride = max(1, int(visual_cfg.get("step_stride", 1)))
@@ -1387,6 +1452,20 @@ def main() -> None:
         group_out_dir = out_dir / relative_group
         group_out_dir.mkdir(parents=True, exist_ok=True)
         params, traces = load_outputs(data_dir)
+        if args.experiment_prefix:
+            params = [
+                row for row in params
+                if str(row.get("experiment_name", "")).startswith(args.experiment_prefix)
+            ]
+            traces = [
+                row for row in traces
+                if str(row.get("experiment_name", "")).startswith(args.experiment_prefix)
+            ]
+            if not params:
+                fail(
+                    f"no experiments starting with {args.experiment_prefix!r} "
+                    f"under {data_dir}"
+                )
 
         if mode in {"chart", "all"}:
             plot_position_step_figures(params, traces, group_out_dir)

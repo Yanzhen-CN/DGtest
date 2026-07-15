@@ -103,11 +103,45 @@ def parse_alpha_values(raw: Any) -> list[float | None]:
         except Exception as exc:
             raise SystemExit(f"[ERROR] bad alpha value: {value!r}") from exc
         if alpha < 0:
-            fail(f"use 'none' to disable self-conditioning; scaled alpha must be > 0, got {alpha}")
+            fail(f"alpha must be non-negative, or 'none'; got {alpha}")
         alphas.append(alpha)
     if not alphas:
         fail("no alpha values selected")
     return alphas
+
+
+def parse_scales(raw: str) -> list[float]:
+    try:
+        scales = [float(value.strip()) for value in raw.split(",") if value.strip()]
+    except ValueError as exc:
+        raise SystemExit(f"[ERROR] bad self-conditioning output scale in: {raw!r}") from exc
+    if not scales or any(scale < 0 for scale in scales):
+        fail("self-conditioning output scales must be non-negative")
+    return list(dict.fromkeys(scales))
+
+
+def direct_scale_run_specs(
+    scales_arg: str,
+    steps_arg: str | None,
+    cfg: dict[str, Any],
+) -> list[dict[str, Any]]:
+    scales = parse_scales(scales_arg)
+    steps = parse_step_values(
+        steps_arg if steps_arg else cfg["generation"].get("denoising_steps")
+    )
+    return [
+        {
+            "steps": budget,
+            "experiment": {
+                "name": f"scscale{format_alpha(scale)}",
+                "alpha": 1.0,
+                "mode": "scaled",
+                "output_scale": scale,
+            },
+        }
+        for budget in steps
+        for scale in scales
+    ]
 
 
 def selected_alphas(arg: str | None, cfg: dict[str, Any]) -> list[float | None]:
@@ -468,6 +502,7 @@ def params_csv_row(row: dict[str, Any], gen_cfg: dict[str, Any]) -> dict[str, An
         "prompt": row.get("prompt"),
         "experiment_name": row.get("experiment_name"),
         "self_conditioning_alpha": row.get("alpha"),
+        "self_conditioning_output_scale": row.get("output_scale", 1.0),
         "mode": row.get("mode"),
         "seed": row.get("seed"),
         "max_new_tokens": gen_cfg.get("max_new_tokens"),
@@ -489,6 +524,7 @@ def trace_csv_rows(
     sample_id: str,
     experiment_name: str,
     alpha: float | None,
+    output_scale: float,
     latency_sec: float,
     generated_text: str,
 ) -> list[dict[str, Any]]:
@@ -558,6 +594,7 @@ def trace_csv_rows(
             "sample_id": sample_id,
             "experiment_name": experiment_name,
             "self_conditioning_alpha": alpha,
+            "self_conditioning_output_scale": output_scale,
             "mode": item.get("mode"),
             "entropy_stage": item.get("entropy_stage", "pre_accept_processed_logits"),
             "trace_index": trace_index,
@@ -633,8 +670,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run DiffusionGemma self-conditioning alpha sweep")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--alphas", default=None, help="comma-separated values; example: 1,0.5,none")
+    parser.add_argument(
+        "--sc-scales",
+        default=None,
+        help="directly scale the gated-MLP self-conditioning branch; example: 1,0.8,0.6,0.4,0.2,0",
+    )
     parser.add_argument("--steps", default=None, help="comma-separated denoising budgets; example: 48,96")
     parser.add_argument("--samples", default=None, help="override sample_file in config")
+    parser.add_argument("--sample-ids", default=None, help="comma-separated sample IDs from the selected sample file")
     parser.add_argument("--restore-patch", action="store_true")
     parser.add_argument("--patch-only", action="store_true")
     args = parser.parse_args()
@@ -664,7 +707,20 @@ def main() -> None:
 
     sample_file = root / (args.samples or cfg["paths"]["sample_file"])
     samples = read_samples(sample_file)
-    run_specs = selected_run_specs(args.alphas, args.steps, cfg)
+    if args.sample_ids:
+        requested_ids = {value.strip() for value in args.sample_ids.split(",") if value.strip()}
+        available_ids = {str(sample["id"]) for sample in samples}
+        missing_ids = requested_ids - available_ids
+        if missing_ids:
+            fail(f"unknown sample IDs: {sorted(missing_ids)}")
+        samples = [sample for sample in samples if str(sample["id"]) in requested_ids]
+    if args.sc_scales is not None and args.alphas is not None:
+        fail("--sc-scales and --alphas are separate interventions; select only one")
+    run_specs = (
+        direct_scale_run_specs(args.sc_scales, args.steps, cfg)
+        if args.sc_scales is not None
+        else selected_run_specs(args.alphas, args.steps, cfg)
+    )
     step_budgets = list(dict.fromkeys(int(spec["steps"]) for spec in run_specs))
     canvas_length = int(gen_cfg["max_new_tokens"])
     schedule_steps = int(gen_cfg.get("temperature_schedule_steps", min(step_budgets)))
@@ -689,14 +745,26 @@ def main() -> None:
     model._dg_trace_enabled = True
     model._dg_trace_details = bool(gen_cfg.get("trace_details", True))
 
+    # Scale the gated-MLP branch output immediately before it is added to the
+    # token embedding. This is downstream of softmax and RMSNorm, unlike the
+    # historical logits-alpha intervention.
+    sc_down_proj = model.model.decoder.self_conditioning.down_proj
+
+    def scale_self_conditioning_output(module, inputs, output):
+        return output * float(getattr(model, "_dg_sc_output_scale", 1.0))
+
+    sc_down_proj.register_forward_hook(scale_self_conditioning_output)
+
     params_fields = [
         "sample_id", "type", "prompt", "experiment_name", "self_conditioning_alpha",
+        "self_conditioning_output_scale",
         "mode", "seed", "max_new_tokens", "max_denoising_steps", "dtype",
         "device_map", "local_files_only", "latency_sec", "tokens_per_forward",
         "trace_error", "generated_text", "full_text",
     ]
     trace_fields = [
-        "sample_id", "experiment_name", "self_conditioning_alpha", "mode", "entropy_stage",
+        "sample_id", "experiment_name", "self_conditioning_alpha",
+        "self_conditioning_output_scale", "mode", "entropy_stage",
         "trace_index", "canvas_index", "generation_step", "accepted_count",
         "changed_count", "mean_entropy", "accepted_positions",
         "changed_positions", "update_ranks", "accepted_tokens",
@@ -721,8 +789,10 @@ def main() -> None:
                 exp = spec["experiment"]
                 alpha = exp["alpha"]
                 mode = exp["mode"]
+                output_scale = float(exp.get("output_scale", 1.0))
                 model._dg_selfcond_mode = mode
                 model._dg_selfcond_alpha = 1.0 if alpha is None else float(alpha)
+                model._dg_sc_output_scale = output_scale
                 model._dg_trace = []
                 if hasattr(model, "_dg_trace_error"):
                     delattr(model, "_dg_trace_error")
@@ -736,7 +806,10 @@ def main() -> None:
                     torch.cuda.manual_seed_all(seed)
                     torch.cuda.synchronize()
 
-                print(f"[RUN] len={canvas_length} steps={steps} sample={sample['id']} {exp['name']} mode={mode}")
+                print(
+                    f"[RUN] len={canvas_length} steps={steps} sample={sample['id']} "
+                    f"{exp['name']} mode={mode} sc_output_scale={output_scale:g}"
+                )
                 start = time.time()
                 with torch.inference_mode():
                     output = model.generate(
@@ -759,6 +832,7 @@ def main() -> None:
                     "experiment_name": exp["name"],
                     "mode": mode,
                     "alpha": alpha,
+                    "output_scale": output_scale,
                     "seed": seed,
                     "latency_sec": latency,
                     "tokens_per_forward": to_py(getattr(output, "tokens_per_forward", None)),
@@ -776,6 +850,7 @@ def main() -> None:
                     sample_id=str(sample["id"]),
                     experiment_name=exp["name"],
                     alpha=alpha,
+                    output_scale=output_scale,
                     latency_sec=latency,
                     generated_text=generated_text,
                 )
@@ -789,7 +864,7 @@ def main() -> None:
                     torch.cuda.empty_cache()
 
         print(f"[DONE] aggregate jsonl: {result_file}")
-    print(f"[DONE] experiment leaves: {output_root}/len{canvas_length}/step*/alpha*/*/")
+    print(f"[DONE] experiment leaves: {output_root}/len{canvas_length}/step*/*/*/")
     print("[NEXT] python visual.py --config config.yaml --mode all")
 
 

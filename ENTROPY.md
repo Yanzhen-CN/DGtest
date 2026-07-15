@@ -31,7 +31,8 @@ python visual_entropy.py
 
 Outputs are written under `visual/entropy/`:
 
-- `entropy_heatmaps.png`: 3 tasks x 3 settings with one shared color scale.
+- `entropy_heatmaps.png`: 3 tasks x 5 settings with one shared color scale,
+  including both 48- and 96-step zero-logits runs.
 - `mean_entropy_vs_step.png`: mean entropy over all 256 positions.
 - `accepted_tokens_vs_step.png`: per-step accepted token count.
 - `entropy_trace_long.csv`: step-level values and accepted-position lists.

@@ -19,6 +19,7 @@ class ExperimentSpec:
     name: str
     label: str
     steps: int
+    output_name: str
 
 
 @dataclass
@@ -84,7 +85,7 @@ def load_trace(
         output_root
         / f"len{canvas_length}"
         / f"step{spec.steps}"
-        / spec.name
+        / spec.output_name
         / sample_id
         / "trace.csv"
     )
@@ -263,8 +264,8 @@ def plot_lines(
     out_path: Path,
     metric: str,
 ) -> None:
-    colors = ["#1f77b4", "#2ca02c", "#d62728"]
-    linestyles = ["-", "--", "-."]
+    colors = ["#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd", "#d62728"]
+    linestyles = ["-", "--", ":", (0, (3, 1, 1, 1)), "-."]
     fig, axes = plt.subplots(
         1, len(samples), figsize=(5.2 * len(samples), 4.4),
         squeeze=False,
@@ -332,6 +333,7 @@ def main() -> None:
             name=str(item["name"]),
             label=str(item.get("label", item["name"])),
             steps=int(item["steps"]),
+            output_name=str(item.get("output_name", item["name"])),
         )
         for item in entropy_cfg.get("experiments", [])
     ]

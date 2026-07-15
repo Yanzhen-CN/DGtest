@@ -41,7 +41,6 @@ sweep:
       steps: 48
     - alpha: 0.5
       steps: 48
-      
     - alpha: 0.0
       steps: 96
     - alpha: none

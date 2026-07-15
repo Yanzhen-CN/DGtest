@@ -1090,6 +1090,7 @@ class DiffusionGemmaGenerationMixin:
                         "cur_step": int(cur_step.detach().cpu().item()) if torch.is_tensor(cur_step) else int(cur_step),
                         "mode": dg_selfcond_mode,
                         "alpha": float(dg_selfcond_alpha),
+                        "entropy_stage": "pre_accept_processed_logits",
                         "accepted_count": accepted_count.detach().cpu().tolist(),
                         "mean_entropy": token_entropy.mean(dim=-1).detach().cpu().tolist(),
                     }

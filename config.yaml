@@ -2,14 +2,16 @@ model_id: google/diffusiongemma-26B-A4B-it
 
 paths:
   transformers_generation_file: vendor/transformers/src/transformers/models/diffusion_gemma/generation_diffusion_gemma.py
-  sample_file: samples/prompts1.jsonl
+  sample_file: samples/prompts.jsonl
   output_root: outputs
   visual_dir: visual
 
 generation:
-  max_new_tokens: 1024
-  # Each step budget is run for every self-conditioning strength.
+  max_new_tokens: 256
+  # Fallback Cartesian-product budgets used when --alphas/--steps override the
+  # exact experiment matrix below.
   denoising_steps:
+    - 48
     - 96
   # Keep the 48-step temperature trajectory unchanged. Longer runs remain at
   # t_min after this many chronological denoising steps.
@@ -29,9 +31,39 @@ sweep:
   # alpha > 0: next self-conditioning logits = alpha * processed_logits
   # none: self-conditioning is disabled and None is passed to decoder
   alphas:
+    - 1.0
+    - 0.5
     - none
+  # Default entropy-convergence experiment: compare the first 48 steps at the
+  # same schedule, then let none continue at t_min for compensation analysis.
+  experiments:
+    - alpha: 1.0
+      steps: 48
+    - alpha: 0.5
+      steps: 48
+    - alpha: none
+      steps: 96
 
 visual:
   max_chain_tokens: 80
   step_stride: 1
   mode: all
+
+entropy_visual:
+  canvas_length: 256
+  samples:
+    - codemerge
+    - mathkkt
+    - rewrite3
+  baseline_steps: 48
+  output_dir: visual/entropy
+  experiments:
+    - name: alpha1
+      label: "alpha=1.0, 48 steps"
+      steps: 48
+    - name: alpha0p5
+      label: "alpha=0.5, 48 steps"
+      steps: 48
+    - name: alphanone
+      label: "none, 96 steps"
+      steps: 96

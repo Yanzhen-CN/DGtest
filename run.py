@@ -133,6 +133,48 @@ def experiment_for_alpha(alpha: float | None) -> dict[str, Any]:
     return {"name": alpha_name(alpha), "alpha": alpha, "mode": alpha_mode(alpha)}
 
 
+def selected_run_specs(
+    alpha_arg: str | None,
+    steps_arg: str | None,
+    cfg: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Resolve exact (alpha, step-budget) pairs.
+
+    CLI overrides retain the historical Cartesian-product behavior. Without
+    overrides, ``sweep.experiments`` can express asymmetric budgets such as
+    alpha1/alpha0.5 at 48 steps and none at 96 steps.
+    """
+    configured = cfg.get("sweep", {}).get("experiments")
+    if alpha_arg is None and steps_arg is None and configured is not None:
+        if not isinstance(configured, list) or not configured:
+            fail("sweep.experiments must be a non-empty list")
+        specs: list[dict[str, Any]] = []
+        seen: set[tuple[str, int]] = set()
+        for item in configured:
+            if not isinstance(item, dict) or "alpha" not in item or "steps" not in item:
+                fail("each sweep.experiments item requires alpha and steps")
+            alpha = parse_alpha_values([item["alpha"]])[0]
+            steps = int(item["steps"])
+            if steps <= 0:
+                fail("experiment steps must be a positive integer")
+            experiment = experiment_for_alpha(alpha)
+            key = (experiment["name"], steps)
+            if key not in seen:
+                specs.append({"steps": steps, "experiment": experiment})
+                seen.add(key)
+        return specs
+
+    alphas = selected_alphas(alpha_arg, cfg)
+    steps = parse_step_values(
+        steps_arg if steps_arg else cfg["generation"].get("denoising_steps")
+    )
+    return [
+        {"steps": budget, "experiment": experiment_for_alpha(alpha)}
+        for budget in steps
+        for alpha in alphas
+    ]
+
+
 def budget_dir(output_root: Path, canvas_length: int, steps: int) -> Path:
     return output_root / f"len{canvas_length}" / f"step{steps}"
 
@@ -287,6 +329,7 @@ def patch_transformers(cfg: dict[str, Any], root: Path) -> None:
                         "cur_step": int(cur_step.detach().cpu().item()) if torch.is_tensor(cur_step) else int(cur_step),
                         "mode": dg_selfcond_mode,
                         "alpha": float(dg_selfcond_alpha),
+                        "entropy_stage": "pre_accept_processed_logits",
                         "accepted_count": accepted_count.detach().cpu().tolist(),
                         "mean_entropy": token_entropy.mean(dim=-1).detach().cpu().tolist(),
                     }}
@@ -516,6 +559,7 @@ def trace_csv_rows(
             "experiment_name": experiment_name,
             "self_conditioning_alpha": alpha,
             "mode": item.get("mode"),
+            "entropy_stage": item.get("entropy_stage", "pre_accept_processed_logits"),
             "trace_index": trace_index,
             "canvas_index": canvas_index,
             "generation_step": step,
@@ -567,21 +611,22 @@ def trace_csv_rows(
 def clear_experiment_outputs(
     output_root: Path,
     canvas_length: int,
-    step_budgets: list[int],
-    experiments: list[dict[str, Any]],
+    run_specs: list[dict[str, Any]],
     samples: list[dict[str, Any]],
 ) -> None:
-    for steps in step_budgets:
+    for steps in sorted({int(spec["steps"]) for spec in run_specs}):
         results_path = budget_dir(output_root, canvas_length, steps) / "results.jsonl"
         if results_path.exists():
             results_path.unlink()
-        for exp in experiments:
-            for sample in samples:
-                leaf = sample_dir(output_root, canvas_length, steps, exp, sample["id"])
-                for filename in ("params.csv", "trace.csv", "final_output.txt"):
-                    path = leaf / filename
-                    if path.exists():
-                        path.unlink()
+    for spec in run_specs:
+        steps = int(spec["steps"])
+        exp = spec["experiment"]
+        for sample in samples:
+            leaf = sample_dir(output_root, canvas_length, steps, exp, sample["id"])
+            for filename in ("params.csv", "trace.csv", "final_output.txt"):
+                path = leaf / filename
+                if path.exists():
+                    path.unlink()
 
 
 def main() -> None:
@@ -619,14 +664,14 @@ def main() -> None:
 
     sample_file = root / (args.samples or cfg["paths"]["sample_file"])
     samples = read_samples(sample_file)
-    experiments = [experiment_for_alpha(alpha) for alpha in selected_alphas(args.alphas, cfg)]
-    step_budgets = parse_step_values(args.steps if args.steps else gen_cfg.get("denoising_steps"))
+    run_specs = selected_run_specs(args.alphas, args.steps, cfg)
+    step_budgets = list(dict.fromkeys(int(spec["steps"]) for spec in run_specs))
     canvas_length = int(gen_cfg["max_new_tokens"])
     schedule_steps = int(gen_cfg.get("temperature_schedule_steps", min(step_budgets)))
     if schedule_steps <= 0:
         fail("generation.temperature_schedule_steps must be positive")
     os.environ["DG_TEMPERATURE_SCHEDULE_STEPS"] = str(schedule_steps)
-    clear_experiment_outputs(output_root, canvas_length, step_budgets, experiments, samples)
+    clear_experiment_outputs(output_root, canvas_length, run_specs, samples)
 
     seed = int(gen_cfg["seed"])
     print(f"[LOAD] {cfg['model_id']}")
@@ -651,7 +696,7 @@ def main() -> None:
         "trace_error", "generated_text", "full_text",
     ]
     trace_fields = [
-        "sample_id", "experiment_name", "self_conditioning_alpha", "mode",
+        "sample_id", "experiment_name", "self_conditioning_alpha", "mode", "entropy_stage",
         "trace_index", "canvas_index", "generation_step", "accepted_count",
         "changed_count", "mean_entropy", "accepted_positions",
         "changed_positions", "update_ranks", "accepted_tokens",
@@ -665,13 +710,15 @@ def main() -> None:
     ]
 
     for steps in step_budgets:
+        budget_specs = [spec for spec in run_specs if int(spec["steps"]) == steps]
         result_file = budget_dir(output_root, canvas_length, steps) / "results.jsonl"
         result_file.parent.mkdir(parents=True, exist_ok=True)
         run_gen_cfg = dict(gen_cfg, max_denoising_steps=steps)
         with result_file.open("w", encoding="utf-8") as fout:
-            for sample, exp in (
-                (sample, exp) for sample in samples for exp in experiments
+            for sample, spec in (
+                (sample, spec) for sample in samples for spec in budget_specs
             ):
+                exp = spec["experiment"]
                 alpha = exp["alpha"]
                 mode = exp["mode"]
                 model._dg_selfcond_mode = mode
